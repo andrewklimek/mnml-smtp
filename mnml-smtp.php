@@ -2,8 +2,8 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.12
-Author: Mnml Web
+Version: 1.13
+Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
 
@@ -103,8 +103,8 @@ class MnmlSMTP {
     }
 
     public static function queue_email($skip, $atts) {
-        if (defined('DOING_MNMLSMTP') || defined('DOING_CRON')) return $skip;
-        
+        if (defined('DOING_MNMLSMTP')) return $skip;
+
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
         $wpdb->insert($table, [
@@ -117,8 +117,16 @@ class MnmlSMTP {
             'created_at' => current_time('mysql'),
         ]);
         $email_id = $wpdb->insert_id;
-        error_log('Mnml SMTP: Queued email ID ' . $email_id);
-        self::send_async(['id' => $email_id]);
+        if (!$email_id) {
+            error_log('Mnml SMTP: Failed to queue email: ' . $wpdb->last_error);
+            return $skip;
+        }
+        error_log('Mnml SMTP: Queued email ID ' . $email_id . (defined('DOING_CRON') ? ' (cron)' : ''));
+        if (defined('DOING_CRON')) {
+            self::send_emails(['id' => $email_id]);
+        } else {
+            self::send_async(['id' => $email_id]);
+        }
         return true;
     }
 
@@ -451,9 +459,8 @@ class MnmlSMTP {
         ?>
         <style>
             .mnml-smtp-queue tr.sent .msg {text-decoration:line-through}
-            dialog.mnml-smtp-dialog {max-width:500px;border:none;border-radius:5px;padding:15px}
+            dialog.mnml-smtp-dialog {width:910px;max-width:90%;border:1px solid #555;border-radius:3px}
             dialog.mnml-smtp-dialog::backdrop {background:rgba(0,0,0,.5)}
-            .mnml-smtp-dialog-close {float:right;cursor:pointer;font-size:18px}
             .mnml-smtp-dialog p {margin:5px 0}
             <?php if (!$is_admin) : ?>
                 .mnml-smtp-queue .hide {opacity:.2;pointer-events:none}
@@ -522,7 +529,7 @@ class MnmlSMTP {
             echo "<p><a href='?all'>Show all</a></p>";
         }
         echo "</form>";
-        echo "<dialog id='mnml-smtp-dialog' class='mnml-smtp-dialog'><div><span class='mnml-smtp-dialog-close'>×</span><div id='mnml-smtp-dialog-body'></div></div></dialog>";
+        echo "<dialog id='mnml-smtp-dialog' class='mnml-smtp-dialog'><div><div id='mnml-smtp-dialog-body'></div></div></dialog>";
         echo "</div>";
         ?>
         <script>
@@ -566,9 +573,6 @@ class MnmlSMTP {
                 });
             }
         });
-        document.querySelector('.mnml-smtp-dialog-close').addEventListener('click',function(){
-            document.getElementById('mnml-smtp-dialog').close();
-        });
         document.getElementById('mnml-smtp-dialog').addEventListener('click',function(e){
             if(e.target===this)document.getElementById('mnml-smtp-dialog').close();
         });
@@ -583,9 +587,11 @@ class MnmlSMTP {
         $email_id = intval($_POST['email_id']);
         $email = $wpdb->get_row($wpdb->prepare("SELECT to_email, subject, message FROM {$wpdb->prefix}mnml_smtp_queue WHERE id = %d", $email_id));
         if ($email) {
-            $content = '<p><strong>To:</strong> ' . esc_html($email->to_email) . '</p>';
-            $content .= '<p><strong>Subject:</strong> ' . esc_html($email->subject) . '</p>';
-            $content .= '<p><strong>Body:</strong></p>' . wp_kses_post($email->message);
+            // Extend allowed HTML to include <style>
+            add_filter('wp_kses_allowed_html', function ($tags, $context) { return $context === 'post' ? $tags + ['style'=>[]] : $tags; }, 10, 2);
+            $content = '<p><strong>To:</strong> ' . esc_html($email->to_email);
+            $content .= '<p><strong>Subject:</strong> ' . esc_html($email->subject);
+            $content .= '<hr>' . wp_kses_post($email->message);
             wp_send_json(['content' => $content]);
         } else {
             wp_send_json(['content' => 'Email not found']);
