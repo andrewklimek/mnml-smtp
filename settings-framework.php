@@ -66,8 +66,8 @@ if (!empty($_REQUEST['options']) && !empty($_REQUEST['action']) && $_REQUEST['ac
         }
     }
 
-    wp_safe_redirect(add_query_arg('updated', 'true', wp_get_referer()));
-    exit;
+    // wp_safe_redirect(add_query_arg('updated', 'true', wp_get_referer()));
+    // exit;
 }
 
 echo "<div class=wrap>";
