@@ -2,7 +2,7 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.13
+Version: 1.14
 Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
@@ -20,10 +20,7 @@ class MnmlSMTP {
         add_action('wp_ajax_mnml_smtp_test_email', [__CLASS__, 'test_email']);
         add_action('wp_ajax_mnml_smtp_resend', [__CLASS__, 'ajax_resend']);
         add_action('wp_ajax_mnml_smtp_view_email', [__CLASS__, 'ajax_view_email']);
-        add_action('wp_ajax_mnml_smtp_bulk_ajax', [__CLASS__, 'handle_bulk']);
-        add_action('admin_post_mnml_smtp_bulk', [__CLASS__, 'handle_bulk']);
         add_action('admin_post_mnml_smtp_resume', [__CLASS__, 'resume_queue']);
-        add_shortcode('mnml_smtp_queue', [__CLASS__, 'shortcode_queue']);
         add_action('admin_notices', [__CLASS__, 'paused_notice']);
         add_filter('wp_mail_from', [__CLASS__, 'set_from_email'], 9);
         add_filter('wp_mail_from_name', [__CLASS__, 'set_from_name'], 9);
@@ -136,7 +133,12 @@ class MnmlSMTP {
             return;
         }
         $phpmailer->isSMTP();
-        $phpmailer->Host = get_option('mnml_smtp_smtp_host', $mailer_type === 'google' ? 'smtp.gmail.com' : ($mailer_type === 'ses' ? 'email-smtp.us-east-1.amazonaws.com' : ($mailer_type === 'brevo' ? 'smtp-relay.brevo.com' : 'smtp.gmail.com')));
+        // $phpmailer->SMTPDebug = 3;
+        // $phpmailer->Debugoutput = 'error_log';
+        $host = get_option('mnml_smtp_smtp_host', $mailer_type === 'google' ? 'smtp.gmail.com' : ($mailer_type === 'ses' ? 'email-smtp.us-east-1.amazonaws.com' : ($mailer_type === 'brevo' ? 'smtp-relay.brevo.com' : 'smtp.gmail.com')));
+        $phpmailer->Host = $host;
+        // $phpmailer->Host = gethostbyname($host);
+        // $phpmailer->SMTPOptions = ['ssl' => ['verify_peer_name' => false]];
         $phpmailer->Port = get_option('mnml_smtp_smtp_port', 587);
         $phpmailer->SMTPAuth = true;
         $phpmailer->Username = get_option('mnml_smtp_smtp_username');
@@ -185,6 +187,7 @@ class MnmlSMTP {
         $table = $wpdb->prefix . 'mnml_smtp_queue';
         $single_email = isset($atts['id']) ? intval($atts['id']) : 0;
 
+        $start_time = microtime(true);
         if ($single_email) {
             $emails = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND status = 'pending' AND next_attempt <= %d", $single_email, time()));
             if (!$emails) {
@@ -207,10 +210,11 @@ class MnmlSMTP {
             define('DOING_MNMLSMTP', 'queue');
         }
 
+        error_log('Mnml SMTP: DB query time: ' . (microtime(true) - $start_time) . ' seconds');
         error_log('Mnml SMTP: Processing started with ' . count($emails) . ' emails' . ($single_email ? " for ID $single_email" : ''));
+
         $failed_count = self::get_failed_count();
         $new_failures = 0;
-        $start_time = microtime(true);
         $next_attempts = [];
 
         foreach ($emails as $email) {
@@ -223,14 +227,19 @@ class MnmlSMTP {
             }
 
             try {
+                $send_time = microtime(true);
                 $result = wp_mail(
                     $email->to_email,
                     $email->subject,
                     $email->message,
                     unserialize($email->headers)
                 );
+                error_log('Mnml SMTP: Send time for ID ' . $email->id . ': ' . (microtime(true) - $send_time) . ' seconds');
+
                 if ($result) {
+                    $update_time = microtime(true);
                     $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
+                    error_log('Mnml SMTP: DB update time for ID ' . $email->id . ': ' . (microtime(true) - $update_time) . ' seconds');
                     error_log('Mnml SMTP: Email ID ' . $email->id . ' sent successfully');
                 } else {
                     throw new Exception('SMTP failure');
@@ -307,7 +316,7 @@ class MnmlSMTP {
             $count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}mnml_smtp_queue WHERE status = 'failed'");
             set_transient('mnml_smtp_failed_count', $count, 300);
         }
-        return $count;
+        return (int) $count;
     }
 
     public static function admin_menu() {
@@ -402,9 +411,7 @@ class MnmlSMTP {
             echo "<p><a href='" . admin_url('tools.php?page=mnml-smtp-queue') . "'>View Email Log</a></p>";
         });
 
-        add_management_page('Email Queue', 'Email Queue', 'manage_options', 'mnml-smtp-queue', function () {
-            echo self::render_queue_ui(true);
-        });
+        add_management_page('Email Queue', 'Email Queue', 'manage_options', 'mnml-smtp-queue', [__CLASS__, 'queue_page']);
     }
 
     public static function render_test_email($key, $value, $field) {
@@ -447,138 +454,154 @@ class MnmlSMTP {
         }
     }
 
-    public static function render_queue_ui($is_admin = false) {
+    public static function queue_page() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+        // Handle bulk actions
+        $notice = '';
+        if (isset($_REQUEST['action']) && in_array($_REQUEST['action'], ['resend_all_failed', 'resend_checked', 'clear_sent', 'clear_failed']) && check_admin_referer('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce')) {
+            $notice = self::handle_bulk();
+        }
+        require_once __DIR__ . '/class-mnml-smtp-queue-table.php';
+        $table = new Mnml_SMTP_Queue_Table();
+        $table->prepare_items();
+        ?>
+        <div class='wrap'>
+            <h1>Email Queue</h1>
+            <?php if (get_transient('mnml_smtp_paused')): ?>
+                <div class='notice notice-error is-dismissible'>
+                    <p>Queue paused due to excessive failures. <a href='<?php echo esc_url(admin_url('options-general.php?page=mnml-smtp')); ?>'>Update settings</a> or <a href='<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=mnml_smtp_resume'), 'mnml_smtp_resume')); ?>'>resume queue</a>.</p>
+                </div>
+            <?php endif; ?>
+            <?php if ($notice): ?>
+                <div class='notice notice-success is-dismissible'>
+                    <p><?php echo esc_html($notice); ?></p>
+                </div>
+            <?php endif; ?>
+            <form method='post' id='mnml-smtp-queue-form'>
+                <?php wp_nonce_field('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce'); ?>
+                <?php $table->display(); ?>
+            </form>
+            <dialog id='mnml-smtp-dialog' class='mnml-smtp-dialog'>
+                <div><div id='mnml-smtp-dialog-body'></div></div>
+            </dialog>
+            <style>
+                .mnml-smtp-queue tr.sent .msg {text-decoration:line-through}
+                dialog.mnml-smtp-dialog {width:910px;max-width:90%;border:1px solid #555;border-radius:3px}
+                dialog.mnml-smtp-dialog::backdrop {background:rgba(0,0,0,.5)}
+                .mnml-smtp-dialog p {margin:5px 0}
+            </style>
+            <script>
+                document.getElementById('mnml-smtp-queue-form').addEventListener('submit', function(e) {
+                    const action = this.querySelector('select[name="bulk_action"]').value;
+                    const selected = document.querySelectorAll('input[name="email_ids[]"]:checked').length;
+                    if (action && !confirm(
+                        action === 'resend_all_failed' ? 'Resend all failed emails?' :
+                        action === 'resend_checked' ? `Resend ${selected} selected email${selected > 1 ? 's' : ''}?` :
+                        action === 'clear_sent' ? 'Clear all sent emails?' :
+                        'Clear all failed emails?'
+                    )) {
+                        e.preventDefault();
+                    }
+                });
+                document.querySelector('.wp-list-table').addEventListener('click', function(e) {
+                    if (e.target.matches('a[data-action]')) {
+                        e.preventDefault();
+                        const action = e.target.dataset.action;
+                        const emailId = e.target.dataset.id;
+                        if (action === 'resend') {
+                            if (confirm('Resend this email?')) {
+                                fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: `action=mnml_smtp_resend&email_id=${emailId}&_wpnonce=<?php echo wp_create_nonce('mnml_smtp_resend'); ?>`
+                                })
+                                .then(response => response.text())
+                                .then(result => {
+                                    if (result === 'ok') {
+                                        e.target.closest('tr').querySelector('td:nth-child(5)').textContent = 'pending';
+                                    }
+                                })
+                                .catch(error => console.error('Resend failed:', error));
+                            }
+                        } else if (action === 'view') {
+                            fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: `action=mnml_smtp_view_email&email_id=${emailId}&_wpnonce=<?php echo wp_create_nonce('mnml_smtp_queue'); ?>`
+                            })
+                            .then(response => response.json())
+                            .then(result => {
+                                const dialog = document.getElementById('mnml-smtp-dialog');
+                                dialog.querySelector('#mnml-smtp-dialog-body').innerHTML = result.content;
+                                dialog.showModal();
+                            })
+                            .catch(error => console.error('View failed:', error));
+                        }
+                    }
+                });
+                document.getElementById('mnml-smtp-dialog').addEventListener('click', function(e) {
+                    if (e.target === this) {
+                        this.close();
+                    }
+                });
+            </script>
+        </div>
+        <?php
+    }
+
+    public static function handle_bulk() {
+        if (!current_user_can('manage_options') || !check_admin_referer('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce')) {
+            wp_die('Unauthorized');
+        }
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
-        $limit = isset($_GET['all']) ? '' : 'limit 100';
-        $emails = $wpdb->get_results("SELECT * FROM $table ORDER BY id DESC $limit");
-        $failed_count = self::get_failed_count();
-        $endpoint = admin_url('admin-ajax.php');
-        $nonce = wp_create_nonce('mnml_smtp_queue');
-        ob_start();
-        ?>
-        <style>
-            .mnml-smtp-queue tr.sent .msg {text-decoration:line-through}
-            dialog.mnml-smtp-dialog {width:910px;max-width:90%;border:1px solid #555;border-radius:3px}
-            dialog.mnml-smtp-dialog::backdrop {background:rgba(0,0,0,.5)}
-            .mnml-smtp-dialog p {margin:5px 0}
-            <?php if (!$is_admin) : ?>
-                .mnml-smtp-queue .hide {opacity:.2;pointer-events:none}
-                .mnml-smtp-queue th,.mnml-smtp-queue td {padding:8px}
-                .mnml-smtp-queue {width:100%;border-collapse:collapse;font-family:Arial,sans-serif}
-                .mnml-smtp-queue th {background:#f4f4f4}
-                .mnml-smtp-queue td {border-bottom:1px solid #ddd}
-                .mnml-smtp-bulk-actions {margin-bottom:10px}
-                .mnml-smtp-button {padding:5px 10px;background:#0073aa;color:#fff;border:none;cursor:pointer}
-                .mnml-smtp-notice {padding:10px;background:#ffe6e6;border:1px solid #cc0000;margin-bottom:10px}
-            <?php endif; ?>
-        </style>
-        <?php
-        echo "<div class='wrap mnml-smtp-queue-wrap'>";
-        if (get_transient('mnml_smtp_paused')) {
-            echo "<div class='" . ($is_admin ? 'notice notice-error is-dismissible' : 'mnml-smtp-notice') . "'>";
-            echo "<p>Queue paused due to repeated failures. ";
-            if ($is_admin) {
-                echo "<a href='" . esc_url(admin_url('options-general.php?page=mnml-smtp')) . "'>Update settings</a> or ";
-                echo "<a href='" . esc_url(wp_nonce_url(admin_url('admin-post.php?action=mnml_smtp_resume'), 'mnml_smtp_resume')) . "'>resume queue</a>.";
-            } else {
-                echo "Contact your administrator to resolve.";
+        $action = isset($_REQUEST['action']) && $_REQUEST['action'] !== '-1' ? sanitize_text_field($_REQUEST['action']) : (isset($_REQUEST['action2']) && $_REQUEST['action2'] !== '-1' ? sanitize_text_field($_REQUEST['action2']) : '');
+        $email_ids = isset($_POST['email_ids']) && is_array($_POST['email_ids']) ? array_map('intval', $_POST['email_ids']) : [];
+
+        if ($action === 'resend_all_failed') {
+            $ids = $wpdb->get_col("SELECT id FROM $table WHERE status = 'failed'");
+            foreach ($ids as $id) {
+                $wpdb->update($table, ['status' => 'pending', 'attempts' => 0, 'next_attempt' => time(), 'error' => ''], ['id' => $id]);
+                self::send_async(['id' => $id]);
             }
-            echo "</p></div>";
-        }
-        echo "<form method='post' action='" . esc_url($is_admin ? admin_url('admin-post.php') : $endpoint) . "' id='mnml-smtp-queue-form'>";
-        wp_nonce_field('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce');
-        echo "<input type='hidden' name='action' value='" . ($is_admin ? 'mnml_smtp_bulk' : 'mnml_smtp_bulk_ajax') . "'>";
-        echo "<div class='" . ($is_admin ? 'tablenav top' : 'mnml-smtp-bulk-actions') . "'>";
-        echo "<select name='bulk_action'>";
-        echo "<option value=''>Bulk Actions</option>";
-        echo "<option value='resend_all_failed'>Resend All Failed</option>";
-        echo "<option value='resend_checked'>Resend Checked</option>";
-        echo "<option value='clear_sent'>Clear Sent</option>";
-        echo "<option value='clear_failed'>Clear Failed</option>";
-        echo "</select>";
-        echo "<input type='submit' class='" . ($is_admin ? 'button' : 'mnml-smtp-button') . "' value='Apply'>";
-        echo "<div style='float:right'>Failed emails: " . esc_html($failed_count) . "</div>";
-        echo "</div>";
-        echo "<table class='mnml-smtp-queue" . ($is_admin ? ' wp-list-table widefat fixed striped' : '') . "'>";
-        echo "<thead><tr>";
-        echo "<th style='width:30px'><input type='checkbox' id='select-all'>";
-        echo "<th style='width:50px'>ID";
-        echo "<th>To";
-        echo "<th>Subject";
-        echo "<th style='width:80px'>Status";
-        echo "<th style='width:80px'>Attempts";
-        echo "<th>Next Attempt";
-        echo "<th>Error";
-        echo "<th style='width:80px'>Actions";
-        echo "</thead><tbody>";
-        foreach ($emails as $email) {
-            echo "<tr data-email_id='" . intval($email->id) . "' class='" . esc_attr($email->status) . "'>";
-            echo "<td><input type='checkbox' name='email_ids[]' value='" . intval($email->id) . "'>";
-            echo "<td>" . intval($email->id);
-            echo "<td>" . esc_html($email->to_email);
-            echo "<td>" . esc_html($email->subject);
-            echo "<td>" . esc_html($email->status);
-            echo "<td>" . ($email->status === 'sent' ? '' : intval($email->attempts));
-            echo "<td>" . ($email->status === 'sent' ? '' : ($email->next_attempt ? date('Y-m-d H:i:s', $email->next_attempt) : '-'));
-            echo "<td class='msg'>" . esc_html($email->error);
-            echo "<td><a href='#' title='Resend this email' data-action='resend'>resend</a> | <a href='#' title='View email content' data-action='view'>view</a>";
-        }
-        echo "</tbody></table>";
-        if ($limit) {
-            echo "<p><a href='?all'>Show all</a></p>";
-        }
-        echo "</form>";
-        echo "<dialog id='mnml-smtp-dialog' class='mnml-smtp-dialog'><div><div id='mnml-smtp-dialog-body'></div></div></dialog>";
-        echo "</div>";
-        ?>
-        <script>
-        document.getElementById('select-all').addEventListener('change',function(){document.querySelectorAll('input[name="email_ids[]"]').forEach(cb=>cb.checked=this.checked)});
-        document.querySelector('#mnml-smtp-queue-form').addEventListener('submit',function(e){
-            var action=this.querySelector('select[name="bulk_action"]').value;
-            var selected=document.querySelectorAll('input[name="email_ids[]"]:checked').length;
-            if(action&&!confirm(
-                action==='resend_all_failed'?'Resend all failed emails?':
-                action==='resend_checked'?'Resend '+selected+' selected email'+(selected>1?'s':'')+'?':
-                action==='clear_sent'?'Clear all sent emails?':
-                'Clear all failed emails?'
-            )){e.preventDefault()}
-        });
-        document.querySelector('.<?php echo ($is_admin ? 'wp-list-table' : 'mnml-smtp-queue'); ?>').addEventListener('click',function(e){
-            if(e.target.dataset.action==='resend'){
-                e.preventDefault();
-                var row=e.target.closest('tr');
-                if(confirm('Resend this email?')){
-                    fetch('<?php echo esc_url($endpoint); ?>',{
-                        method:'POST',
-                        headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                        body:'action=mnml_smtp_resend&email_id='+row.dataset.email_id+'&_wpnonce=<?php echo esc_js($nonce); ?>'
-                    })
-                    .then(r=>r.text())
-                    .then(r=>{if(r==='ok')row.querySelector('td:nth-child(5)').innerText='pending'});
-                }
-            } else if(e.target.dataset.action==='view'){
-                e.preventDefault();
-                var row=e.target.closest('tr');
-                fetch('<?php echo esc_url($endpoint); ?>',{
-                    method:'POST',
-                    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                    body:'action=mnml_smtp_view_email&email_id='+row.dataset.email_id+'&_wpnonce=<?php echo esc_js($nonce); ?>'
-                })
-                .then(r=>r.json())
-                .then(r=>{
-                    var dialog=document.getElementById('mnml-smtp-dialog');
-                    dialog.querySelector('#mnml-smtp-dialog-body').innerHTML=r.content;
-                    dialog.showModal();
-                });
+            error_log('Mnml SMTP: Resent all failed emails');
+            return 'All failed emails have been queued for resending.';
+        } elseif ($action === 'resend_checked' && $email_ids) {
+            foreach ($email_ids as $id) {
+                $wpdb->update($table, ['status' => 'pending', 'attempts' => 0, 'next_attempt' => time(), 'error' => ''], ['id' => $id]);
+                self::send_async(['id' => $id]);
             }
-        });
-        document.getElementById('mnml-smtp-dialog').addEventListener('click',function(e){
-            if(e.target===this)document.getElementById('mnml-smtp-dialog').close();
-        });
-    </script>
-    <?php
-        return ob_get_clean();
+            error_log('Mnml SMTP: Resent ' . count($email_ids) . ' selected emails');
+            return count($email_ids) . ' selected email' . (count($email_ids) > 1 ? 's' : '') . ' have been queued for resending.';
+        } elseif ($action === 'clear_sent') {
+            $wpdb->delete($table, ['status' => 'sent']);
+            error_log('Mnml SMTP: Cleared sent emails');
+            return 'All sent emails have been cleared.';
+        } elseif ($action === 'clear_failed') {
+            $wpdb->delete($table, ['status' => 'failed']);
+            error_log('Mnml SMTP: Cleared failed emails');
+            delete_transient('mnml_smtp_failed_count');
+            return 'All failed emails have been cleared.';
+        }
+        return '';
+    }
+
+    public static function ajax_resend() {
+        check_ajax_referer('mnml_smtp_resend', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+        global $wpdb;
+        $table = $wpdb->prefix . 'mnml_smtp_queue';
+        $email_id = isset($_POST['email_id']) ? intval($_POST['email_id']) : 0;
+        if ($email_id) {
+            $wpdb->update($table, ['status' => 'pending', 'attempts' => 0, 'next_attempt' => time(), 'error' => ''], ['id' => $email_id]);
+            self::send_async(['id' => $email_id]);
+            wp_send_json('ok');
+        }
+        wp_send_json_error('Invalid email ID');
     }
 
     public static function ajax_view_email() {
@@ -587,61 +610,19 @@ class MnmlSMTP {
         $email_id = intval($_POST['email_id']);
         $email = $wpdb->get_row($wpdb->prepare("SELECT to_email, subject, message FROM {$wpdb->prefix}mnml_smtp_queue WHERE id = %d", $email_id));
         if ($email) {
-            // Extend allowed HTML to include <style>
-            add_filter('wp_kses_allowed_html', function ($tags, $context) { return $context === 'post' ? $tags + ['style'=>[]] : $tags; }, 10, 2);
-            $content = '<p><strong>To:</strong> ' . esc_html($email->to_email);
-            $content .= '<p><strong>Subject:</strong> ' . esc_html($email->subject);
-            $content .= '<hr>' . wp_kses_post($email->message);
+            add_filter('wp_kses_allowed_html', function ($tags, $context) {
+                if ($context === 'post') {
+                    $tags['style'] = [];
+                }
+                return $tags;
+            }, 10, 2);
+            $content = '<p><strong>To:</strong> ' . esc_html($email->to_email) . '</p>';
+            $content .= '<p><strong>Subject:</strong> ' . esc_html($email->subject) . '</p>';
+            $content .= '<p><strong>Body:</strong></p>' . wp_kses_post($email->message);
             wp_send_json(['content' => $content]);
         } else {
             wp_send_json(['content' => 'Email not found']);
         }
-    }
-
-    public static function handle_bulk() {
-        check_admin_referer('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce');
-        global $wpdb;
-        $table = $wpdb->prefix . 'mnml_smtp_queue';
-        $action = $_POST['bulk_action'];
-        $email_ids = isset($_POST['email_ids']) ? array_map('intval', $_POST['email_ids']) : [];
-
-        if ($action === 'resend_all_failed') {
-            $wpdb->query("UPDATE $table SET status = 'pending', attempts = 0, next_attempt = " . time() . ", error = '' WHERE status = 'failed'");
-            self::send_async(['queue' => true]);
-        } elseif ($action === 'resend_checked' && $email_ids) {
-            $wpdb->query("UPDATE $table SET status = 'pending', attempts = 0, next_attempt = " . time() . ", error = '' WHERE id IN (" . implode(',', $email_ids) . ")");
-            self::send_async(['queue' => true]);
-        } elseif ($action === 'clear_sent') {
-            $wpdb->query("DELETE FROM $table WHERE status = 'sent'");
-        } elseif ($action === 'clear_failed') {
-            $wpdb->query("DELETE FROM $table WHERE status = 'failed'");
-        }
-
-        delete_transient('mnml_smtp_failed_count');
-
-        if (defined('DOING_AJAX') && DOING_AJAX) {
-            echo 'ok';
-            wp_die();
-        } else {
-            wp_redirect(admin_url('tools.php?page=mnml-smtp-queue'));
-            exit;
-        }
-    }
-
-    public static function ajax_resend() {
-        check_ajax_referer('mnml_smtp_queue');
-        global $wpdb;
-        $email_id = intval($_POST['email_id']);
-        $wpdb->update($wpdb->prefix . 'mnml_smtp_queue', [
-            'status' => 'pending',
-            'attempts' => 0,
-            'next_attempt' => time(),
-            'error' => '',
-        ], ['id' => $email_id]);
-        self::send_async(['id' => $email_id]);
-        delete_transient('mnml_smtp_failed_count');
-        echo 'ok';
-        wp_die();
     }
 
     public static function resume_queue() {
@@ -650,13 +631,6 @@ class MnmlSMTP {
         self::send_async(['queue' => true]);
         wp_redirect(admin_url('tools.php?page=mnml-smtp-queue'));
         exit;
-    }
-
-    public static function shortcode_queue() {
-        if (!current_user_can(apply_filters('mnml_smtp_queue_capability', 'manage_options'))) {
-            return '<p>Access denied.</p>';
-        }
-        return self::render_queue_ui(false);
     }
 
     public static function paused_notice() {
