@@ -2,7 +2,7 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.15
+Version: 1.16
 Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
@@ -13,7 +13,6 @@ class MnmlSMTP {
         register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
         add_action('mnml_smtp_cleanup', [__CLASS__, 'cleanup_queue']);
         add_action('mnml_smtp_process_queue', [__CLASS__, 'process_queue']);
-        add_action('wp', [__CLASS__, 'schedule_cleanup']);
         add_filter('pre_wp_mail', [__CLASS__, 'queue_email'], 5, 2);
         add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
@@ -58,7 +57,7 @@ class MnmlSMTP {
 
     public static function schedule_cleanup() {
         if (!wp_next_scheduled('mnml_smtp_cleanup')) {
-            wp_schedule_event(time(), 'daily', 'mnml_smtp_cleanup');
+            wp_schedule_single_event(strtotime('tomorrow 4am'), 'mnml_smtp_cleanup');
         }
     }
 
@@ -90,6 +89,7 @@ class MnmlSMTP {
     }
 
     public static function cleanup_queue() {
+        self::schedule_cleanup();
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
         $days = get_option('mnml_smtp_queue_expiry', 7);
