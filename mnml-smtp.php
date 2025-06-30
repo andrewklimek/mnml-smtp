@@ -518,6 +518,8 @@ class MnmlSMTP {
                 dialog.mnml-smtp-dialog {width:910px;max-width:90%;border:1px solid #555;border-radius:3px}
                 dialog.mnml-smtp-dialog::backdrop {background:rgba(0,0,0,.5)}
                 .mnml-smtp-dialog p {margin:5px 0}
+                .column-id, .column-status, .column-attempts {width: 6em}
+                .column-created_at, .column-next_attempt, .column-error {width: 7em}
             </style>
             <script>
                 document.getElementById('mnml-smtp-queue-form').addEventListener('submit', function(e) {
