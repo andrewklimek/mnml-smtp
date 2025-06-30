@@ -520,6 +520,7 @@ class MnmlSMTP {
                 .mnml-smtp-dialog p {margin:5px 0}
                 .column-id, .column-status, .column-attempts {width: 6em}
                 .column-created_at, .column-next_attempt, .column-error {width: 7em}
+                .column-to_email {width: 20em}
             </style>
             <script>
                 document.getElementById('mnml-smtp-queue-form').addEventListener('submit', function(e) {

@@ -59,7 +59,7 @@ class Mnml_SMTP_Queue_Table extends WP_List_Table {
             'resend' => sprintf('<a href="#" data-action="resend" data-id="%s">Resend</a>', $item->id),
             'view' => sprintf('<a href="#" data-action="view" data-id="%s">View</a>', $item->id),
         ];
-        return sprintf('%1$s %2$s', esc_html($item->to_email), $this->row_actions($actions));
+        return sprintf('%1$s %2$s', str_replace( ',', '<br>', esc_html($item->to_email) ), $this->row_actions($actions));
     }
 
     public function column_actions($item) {
@@ -95,7 +95,7 @@ class Mnml_SMTP_Queue_Table extends WP_List_Table {
             $this->get_columns(), // Columns
             [], // Hidden columns (none)
             $this->get_sortable_columns(), // Sortable columns
-            'to_email' // Primary column for row actions
+            []// 'to_email' // Primary column for row actions// adding this seems to add an additional, useless screen-reader button
         ];
 
         $total_items = $wpdb->get_var("SELECT COUNT(*) FROM $table");
