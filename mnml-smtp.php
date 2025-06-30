@@ -133,6 +133,7 @@ class MnmlSMTP {
             return;
         }
         $phpmailer->isSMTP();
+        $phpmailer->XMailer = 'mnml smtp';
         // $phpmailer->SMTPDebug = 3;
         // $phpmailer->Debugoutput = 'error_log';
         $host = get_option('mnml_smtp_smtp_host', $mailer_type === 'google' ? 'smtp.gmail.com' : ($mailer_type === 'ses' ? 'email-smtp.us-east-1.amazonaws.com' : ($mailer_type === 'brevo' ? 'smtp-relay.brevo.com' : 'smtp.gmail.com')));
