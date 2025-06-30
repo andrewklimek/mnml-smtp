@@ -2,7 +2,7 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.14
+Version: 1.15
 Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
@@ -226,6 +226,26 @@ class MnmlSMTP {
                 continue;
             }
 
+            // Check if delivering locally
+            $use_local = false;
+            if ( !strpos($email->to_email, ',') ) {// only applys to single recipients
+                $local_domains = get_option('mnml_smtp_local_domains', '');
+                if ($local_domains) {
+                    $local_domains = array_map('trim', explode(',', $local_domains));
+                    $email_domain = strtolower(substr(strrchr($email->to_email, '@'), 1) ?: '');
+                    if ($email_domain && in_array($email_domain, $local_domains)) {
+                        $use_local = true;
+                        remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+                        unset($GLOBALS['phpmailer']);
+                        error_log('Mnml SMTP: Using local delivery for ' . $email->to_email);
+                    }
+                }
+            }
+            // Restore SMTP hook for non-local emails
+            if (!$use_local) {
+                add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+            }
+
             try {
                 $send_time = microtime(true);
                 $result = wp_mail(
@@ -320,98 +340,105 @@ class MnmlSMTP {
     }
 
     public static function admin_menu() {
-        add_options_page('Mnml SMTP Settings', 'Mnml SMTP', 'manage_options', 'mnml-smtp', function () {
-            $options = [
-                'mnml_smtp_' => [
-                    'mailer_type' => [
-                        'type' => 'select',
-                        'label' => 'Mailer Type',
-                        'options' => [
-                            'smtp' => 'Generic SMTP',
-                            'ses' => 'Amazon SES SMTP',
-                            'google' => 'Google Workspace SMTP',
-                            'brevo' => 'Brevo SMTP',
-                        ],
-                        'desc' => 'Choose the mailer for sending emails.',
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                    'from_email' => [
-                        'type' => 'email',
-                        'label' => 'From Email',
-                        'desc' => 'Email address for outgoing emails.',
-                        'sanitize' => 'sanitize_email',
-                    ],
-                    'from_name' => [
-                        'type' => 'text',
-                        'label' => 'From Name',
-                        'desc' => 'Name for outgoing emails.',
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                    'queue_expiry' => [
-                        'type' => 'number',
-                        'label' => 'Queue Expiry',
-                        'desc' => 'Days to keep sent/failed emails (0 to disable).',
-                        'default' => 7,
-                        'size' => 'small',
-                        'sanitize' => function ($value) { return max(0, (int)$value); },
-                    ],
-                    'test_email' => [
-                        'type' => 'callback',
-                        'label' => 'Test Email',
-                        'callback' => 'MnmlSMTP::render_test_email',
-                        'desc' => 'Send a test email to verify settings.',
-                    ],
-                    'smtp_host' => [
-                        'type' => 'text',
-                        'label' => 'SMTP Host',
-                        'desc' => 'SMTP server host (e.g., smtp.gmail.com, email-smtp.us-east-1.amazonaws.com).',
-                        'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                    'smtp_port' => [
-                        'type' => 'number',
-                        'label' => 'SMTP Port',
-                        'desc' => 'SMTP port (e.g., 587 for TLS).',
-                        'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
-                        'size' => 'small',
-                        'default' => '587',
-                        'sanitize' => function ($value) { return max(1, (int)$value); },
-                    ],
-                    'smtp_encryption' => [
-                        'type' => 'select',
-                        'label' => 'SMTP Encryption',
-                        'options' => [
-                            'none' => 'None',
-                            'tls' => 'TLS',
-                            'ssl' => 'SSL',
-                        ],
-                        'default' => 'tls',
-                        'desc' => 'Encryption type for SMTP.',
-                        'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                    'smtp_username' => [
-                        'type' => 'text',
-                        'label' => 'SMTP Username',
-                        'desc' => 'SMTP username or Google app password.',
-                        'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                    'smtp_password' => [
-                        'type' => 'password',
-                        'label' => 'SMTP Password',
-                        'desc' => 'SMTP password (store in wp-config.php for security).',
-                        'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
-                        'sanitize' => 'sanitize_text_field',
-                    ],
-                ],
-            ];
-            $title = 'Mnml SMTP Settings';
-            require __DIR__ . '/settings-framework.php';
-            echo "<p><a href='" . admin_url('tools.php?page=mnml-smtp-queue') . "'>View Email Log</a></p>";
-        });
-
+        add_options_page('Mnml SMTP Settings', 'Mnml SMTP', 'manage_options', 'mnml-smtp', [__CLASS__, 'settings_page']);
         add_management_page('Email Queue', 'Email Queue', 'manage_options', 'mnml-smtp-queue', [__CLASS__, 'queue_page']);
+    }
+
+    public static function settings_page() {
+        $options = [
+            'mnml_smtp_' => [
+                'mailer_type' => [
+                    'type' => 'select',
+                    'label' => 'Mailer Type',
+                    'options' => [
+                        'smtp' => 'Generic SMTP',
+                        'ses' => 'Amazon SES SMTP',
+                        'google' => 'Google Workspace SMTP',
+                        'brevo' => 'Brevo SMTP',
+                    ],
+                    'desc' => 'Choose the mailer for sending emails.',
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'from_email' => [
+                    'type' => 'email',
+                    'label' => 'From Email',
+                    'desc' => 'Email address for outgoing emails.',
+                    'sanitize' => 'sanitize_email',
+                ],
+                'from_name' => [
+                    'type' => 'text',
+                    'label' => 'From Name',
+                    'desc' => 'Name for outgoing emails.',
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'local_domains' => [
+                    'type' => 'text',
+                    'label' => 'Local Domains',
+                    'desc' => 'Domains to deliver locally, bypassing SMTP.',
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'queue_expiry' => [
+                    'type' => 'number',
+                    'label' => 'Queue Expiry',
+                    'desc' => 'Days to keep sent/failed emails (0 to disable).',
+                    'default' => 7,
+                    'size' => 'small',
+                    'sanitize' => function ($value) { return max(0, (int)$value); },
+                ],
+                'test_email' => [
+                    'type' => 'callback',
+                    'label' => 'Test Email',
+                    'callback' => 'MnmlSMTP::render_test_email',
+                    'desc' => 'Send a test email to verify settings.',
+                ],
+                'smtp_host' => [
+                    'type' => 'text',
+                    'label' => 'SMTP Host',
+                    'desc' => 'SMTP server host (e.g., smtp.gmail.com, email-smtp.us-east-1.amazonaws.com).',
+                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'smtp_port' => [
+                    'type' => 'number',
+                    'label' => 'SMTP Port',
+                    'desc' => 'SMTP port (e.g., 587 for TLS).',
+                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'size' => 'small',
+                    'default' => '587',
+                    'sanitize' => function ($value) { return max(1, (int)$value); },
+                ],
+                'smtp_encryption' => [
+                    'type' => 'select',
+                    'label' => 'SMTP Encryption',
+                    'options' => [
+                        'none' => 'None',
+                        'tls' => 'TLS',
+                        'ssl' => 'SSL',
+                    ],
+                    'default' => 'tls',
+                    'desc' => 'Encryption type for SMTP.',
+                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'smtp_username' => [
+                    'type' => 'text',
+                    'label' => 'SMTP Username',
+                    'desc' => 'SMTP username or Google app password.',
+                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'sanitize' => 'sanitize_text_field',
+                ],
+                'smtp_password' => [
+                    'type' => 'password',
+                    'label' => 'SMTP Password',
+                    'desc' => 'SMTP password (store in wp-config.php for security).',
+                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'sanitize' => 'sanitize_text_field',
+                ],
+            ],
+        ];
+        $title = 'Mnml SMTP Settings';
+        require __DIR__ . '/settings-framework.php';
+        echo "<p><a href='" . admin_url('tools.php?page=mnml-smtp-queue') . "'>View Email Log</a></p>";
     }
 
     public static function render_test_email($key, $value, $field) {
