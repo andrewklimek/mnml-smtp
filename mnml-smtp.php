@@ -50,8 +50,7 @@ class MnmlSMTP {
     }
 
     public static function deactivate() {
-        global $wpdb;
-        $wpdb->query("DROP TABLE IF EXISTS {$wpdb->prefix}mnml_smtp_logs");
+        wp_unschedule_hook('mnml_smtp_cleanup');
         delete_option('mnml_smtp_max_attempts');
     }
 
