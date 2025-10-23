@@ -2,7 +2,7 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.16
+Version: 1.17
 Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
@@ -21,8 +21,8 @@ class MnmlSMTP {
         add_action('wp_ajax_mnml_smtp_view_email', [__CLASS__, 'ajax_view_email']);
         add_action('admin_post_mnml_smtp_resume', [__CLASS__, 'resume_queue']);
         add_action('admin_notices', [__CLASS__, 'paused_notice']);
-        add_filter('wp_mail_from', [__CLASS__, 'set_from_email'], 9);
-        add_filter('wp_mail_from_name', [__CLASS__, 'set_from_name'], 9);
+        add_filter('wp_mail_from', [__CLASS__, 'set_from_email'], 20 );
+        add_filter('wp_mail_from_name', [__CLASS__, 'set_from_name'], 20 );
     }
 
     public static function activate() {
@@ -61,11 +61,13 @@ class MnmlSMTP {
     }
 
     public static function set_from_email($email) {
+        if ( substr( $email, 0, 10 ) !== 'wordpress@' ) return $email;// dont mess with it if alreay set to something other than default
         $from_email = get_option('mnml_smtp_from_email', '');
         return $from_email ? $from_email : $email;
     }
 
     public static function set_from_name($name) {
+        if ( $name !== 'WordPress' ) return $name;// dont mess with it if alreay set to something other than default
         $from_name = get_option('mnml_smtp_from_name', '');
         return $from_name ? $from_name : $name;
     }
