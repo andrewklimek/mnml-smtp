@@ -445,9 +445,9 @@ class MnmlSMTP {
 
     public static function render_test_email($key, $value, $field) {
         $admin_email = esc_attr(get_option('admin_email'));
-        echo '<button type="button" id="mnml_smtp_test" class="button">Send Test Email</button>';
-        echo ' <input type="email" id="mnml_smtp_test_email" value="' . $admin_email . '" class="regular-text" placeholder="Enter email address">';
-        echo '<div id="mnml_smtp_test_result"></div>';
+        echo '<button type=button id=mnml_smtp_test class=button>Send Test Email</button>';
+        echo ' <input type=email id=mnml_smtp_test_email value="' . $admin_email . '" class=regular-text placeholder="Enter email address">';
+        echo '<div id=mnml_smtp_test_result></div>';
         ?>
         <script>
             document.getElementById('mnml_smtp_test').addEventListener('click', function () {
@@ -493,10 +493,10 @@ class MnmlSMTP {
             $notice = self::handle_bulk();
         }
         require_once __DIR__ . '/class-mnml-smtp-queue-table.php';
-        $table = new Mnml_SMTP_Queue_Table();
-        $table->prepare_items();
+        $wp_list_table = new Mnml_SMTP_Queue_Table();
+        $wp_list_table->prepare_items();
         ?>
-        <div class='wrap'>
+        <div class=wrap>
             <h1>Email Queue</h1>
             <?php if (get_transient('mnml_smtp_paused')): ?>
                 <div class='notice notice-error is-dismissible'>
@@ -507,13 +507,20 @@ class MnmlSMTP {
                 <div class='notice notice-success is-dismissible'>
                     <p><?php echo esc_html($notice); ?></p>
                 </div>
-            <?php endif; ?>
-            <form method='post' id='mnml-smtp-queue-form'>
-                <?php wp_nonce_field('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce'); ?>
-                <?php $table->display(); ?>
+            <?php endif;
+            echo '<div style="float:left;line-height:30px">Failed emails: '
+             . esc_html( MnmlSMTP::get_failed_count() ) . '</div>';
+            ?>
+            <form class=search-form method=get>
+            <input type=hidden name=page value=mnml-smtp-queue>
+            <?php $wp_list_table->search_box( 'Search To', 'mnml_smtp_search' ); ?>
             </form>
-            <dialog id='mnml-smtp-dialog' class='mnml-smtp-dialog'>
-                <div><div id='mnml-smtp-dialog-body'></div></div>
+            <form method=post id=mnml-smtp-queue-form>
+                <?php wp_nonce_field('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce'); ?>
+                <?php $wp_list_table->display(); ?>
+            </form>
+            <dialog id=mnml-smtp-dialog class=mnml-smtp-dialog>
+                <div><div id=mnml-smtp-dialog-body></div></div>
             </dialog>
             <style>
                 .mnml-smtp-queue tr.sent .msg {text-decoration:line-through}
