@@ -53,8 +53,12 @@ class Mnml_SMTP_Queue_Table extends WP_List_Table {
         }
 
         // Search (from search_box)
+        $where = '';
         $search = ! empty( $_REQUEST['s'] ) ? trim( sanitize_text_field( $_REQUEST['s'] ) ) : '';
-        $where  = $search ? $wpdb->prepare( ' WHERE to_email LIKE %s', '%' . $wpdb->esc_like( $search ) . '%' ) : '';
+        if ( $search ) {
+            $like = '%' . $wpdb->esc_like( $search ) . '%';
+            $where = $wpdb->prepare( 'WHERE to_email LIKE %s OR subject LIKE %s', $like, $like );
+        }
 
         // Column headers
         $this->_column_headers = [

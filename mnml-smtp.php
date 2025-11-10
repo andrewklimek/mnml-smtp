@@ -513,7 +513,7 @@ class MnmlSMTP {
             ?>
             <form class=search-form method=get>
             <input type=hidden name=page value=mnml-smtp-queue>
-            <?php $wp_list_table->search_box( 'Search To', 'mnml_smtp_search' ); ?>
+            <?php $wp_list_table->search_box( 'Search', 'mnml_smtp_search' ); ?>
             </form>
             <form method=post id=mnml-smtp-queue-form>
                 <?php wp_nonce_field('mnml_smtp_bulk', 'mnml_smtp_bulk_nonce'); ?>
