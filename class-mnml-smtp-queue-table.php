@@ -42,7 +42,7 @@ class Mnml_SMTP_Queue_Table extends WP_List_Table {
             case 'next_attempt':
                 return $item->status === 'sent' ? '' : ($item->$column_name ? date('Y-m-d H:i:s', $item->$column_name) : '-');
             case 'attempts':
-                return $item->status === 'sent' ? '' : intval($item->$column_name);
+                return $item->$column_name ? intval($item->$column_name) : '';
             case 'error':
                 return esc_html($item->$column_name) ? '<span class="msg">' . esc_html($item->$column_name) . '</span>' : '';
             default:
