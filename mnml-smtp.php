@@ -74,7 +74,7 @@ class MnmlSMTP {
 
     public static function process_queue() {
         if (get_transient('mnml_smtp_paused')) {
-            error_log('Mnml SMTP: Queue processing skipped due to paused queue');
+            self::debug('Queue processing skipped due to paused queue');
             return;
         }
         global $wpdb;
@@ -85,7 +85,7 @@ class MnmlSMTP {
 
         if ($count > 0) {
             wp_schedule_single_event(time() + 300, 'mnml_smtp_process_queue');
-            error_log('Mnml SMTP: Rescheduled process_queue due to ' . $count . ' pending emails');
+            self::debug('Rescheduled process_queue due to ' . $count . ' pending emails');
         }
     }
 
@@ -116,10 +116,10 @@ class MnmlSMTP {
         ]);
         $email_id = $wpdb->insert_id;
         if (!$email_id) {
-            error_log('Mnml SMTP: Failed to queue email: ' . $wpdb->last_error);
+            self::debug('Failed to queue email: ' . $wpdb->last_error);
             return $skip;
         }
-        // error_log('Mnml SMTP: Queued email ID ' . $email_id . (defined('DOING_CRON') ? ' (cron)' : ''));
+        // self::debug('Queued email ID ' . $email_id . (defined('DOING_CRON') ? ' (cron)' : ''));
         if (defined('DOING_CRON')) {
             self::send_emails(['id' => $email_id]);
         } else {
@@ -164,15 +164,15 @@ class MnmlSMTP {
             'sslverify' => apply_filters('https_local_ssl_verify', false),
             'body' => array_merge($body, ['secret' => wp_hash('mnml_smtp_secret')]),
         ];
-        // error_log('Mnml SMTP: Sending async request to ' . $url . ' with body: ' . print_r($body, true));
+        // self::debug('Sending async request to ' . $url . ' with body: ' . print_r($body, true));
         $response = wp_remote_post($url, $args);
         if (is_wp_error($response)) {
-            error_log('Mnml SMTP: Async request error: ' . $response->get_error_message() . '; scheduling fallback cron');
+            self::debug('Async request error: ' . $response->get_error_message() . '; scheduling fallback cron');
             wp_schedule_single_event(time() + 30, 'mnml_smtp_process_queue');
             return false;
         }
         if (isset($response['response']['code']) && $response['response']['code'] >= 300 && $response['response']['code'] < 400) {
-            error_log('Mnml SMTP: Async request redirected (code: ' . $response['response']['code'] . ', location: ' . ($response['headers']['location'] ?? 'unknown') . ')');
+            self::debug('Async request redirected (code: ' . $response['response']['code'] . ', location: ' . ($response['headers']['location'] ?? 'unknown') . ')');
             wp_schedule_single_event(time() + 30, 'mnml_smtp_process_queue');
         }
         return $response;
@@ -180,7 +180,7 @@ class MnmlSMTP {
 
     public static function send_emails($atts) {
         if (get_transient('mnml_smtp_paused')) {
-            error_log('Mnml SMTP: Queue paused due to repeated failures');
+            self::debug('Queue paused due to repeated failures');
             delete_transient('mnml_smtp_running');
             return;
         }
@@ -193,27 +193,27 @@ class MnmlSMTP {
         if ($single_email) {
             $emails = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND status = 'pending' AND next_attempt <= %d", $single_email, time()));
             if (!$emails) {
-                error_log("Mnml SMTP: Requested email $single_email was missing");
+                self::debug("Mnml SMTP: Requested email $single_email was missing");
                 return;
             }
             define('DOING_MNMLSMTP', 'single');
         } else {
             $lock = wp_generate_password(12, false);
             if (!set_transient('mnml_smtp_running', $lock, 300)) {
-                error_log('Mnml SMTP: Queue already running');
+                self::debug('Queue already running');
                 return;
             }
             $emails = $wpdb->get_results("SELECT * FROM $table WHERE status = 'pending' AND next_attempt <= " . time() . " ORDER BY next_attempt ASC LIMIT 10");
             if (!$emails) {
                 delete_transient('mnml_smtp_running');
-                error_log('Mnml SMTP: No pending emails to process');
+                self::debug('No pending emails to process');
                 return;
             }
             define('DOING_MNMLSMTP', 'queue');
         }
 
-        // error_log('Mnml SMTP: DB query time: ' . (microtime(true) - $start_time) . ' seconds');
-        // error_log('Mnml SMTP: Processing started with ' . count($emails) . ' emails' . ($single_email ? " for ID $single_email" : ''));
+        // self::debug('DB query time: ' . (microtime(true) - $start_time) . ' seconds');
+        // self::debug('Processing started with ' . count($emails) . ' emails' . ($single_email ? " for ID $single_email" : ''));
 
         $failed_count = self::get_failed_count();
         $new_failures = 0;
@@ -221,7 +221,7 @@ class MnmlSMTP {
 
         foreach ($emails as $email) {
             if (microtime(true) - $start_time > 30) {
-                error_log('Mnml SMTP: Processing timeout reached');
+                self::debug('Processing timeout reached');
                 break;
             }
             if (!$single_email && $email->attempts == 0 && ($email->next_attempt - 30) < time()) {
@@ -239,7 +239,7 @@ class MnmlSMTP {
                         $use_local = true;
                         remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
                         unset($GLOBALS['phpmailer']);
-                        // error_log('Mnml SMTP: Using local delivery for ' . $email->to_email);
+                        // self::debug('Using local delivery for ' . $email->to_email);
                     }
                 }
             }
@@ -256,13 +256,13 @@ class MnmlSMTP {
                     $email->message,
                     unserialize($email->headers)
                 );
-                // error_log('Mnml SMTP: Send time for ID ' . $email->id . ': ' . (microtime(true) - $send_time) . ' seconds');
+                // self::debug('Send time for ID ' . $email->id . ': ' . (microtime(true) - $send_time) . ' seconds');
 
                 if ($result) {
                     $update_time = microtime(true);
                     $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
-                    // error_log('Mnml SMTP: DB update time for ID ' . $email->id . ': ' . (microtime(true) - $update_time) . ' seconds');
-                    // error_log('Mnml SMTP: Email ID ' . $email->id . ' sent successfully');
+                    // self::debug('DB update time for ID ' . $email->id . ': ' . (microtime(true) - $update_time) . ' seconds');
+                    // self::debug('Email ID ' . $email->id . ' sent successfully');
                 } else {
                     throw new Exception('SMTP failure');
                 }
@@ -270,7 +270,7 @@ class MnmlSMTP {
                 $attempts = $email->attempts + 1;
                 $intervals = apply_filters('mnml_smtp_retry_intervals', [300, 3600]);
                 $max_attempts = count($intervals) + 1;
-                error_log('Mnml SMTP: Email ID ' . $email->id . ' failed, attempt ' . $attempts . ' of ' . $max_attempts);
+                self::debug('Email ID ' . $email->id . ' failed, attempt ' . $attempts . ' of ' . $max_attempts);
                 $error_msg = $e->getMessage();
 
                 if ($attempts >= $max_attempts) {
@@ -283,7 +283,7 @@ class MnmlSMTP {
                     ], ['id' => $email->id]);
                     $new_failures++;
                     delete_transient('mnml_smtp_failed_count');
-                    error_log('Mnml SMTP: Email ID ' . $email->id . ' marked as failed: ' . $error_msg);
+                    self::debug('Email ID ' . $email->id . ' marked as failed: ' . $error_msg);
 
                     if ($failed_count + $new_failures >= 10) {
                         set_transient('mnml_smtp_paused', true, DAY_IN_SECONDS);
@@ -294,7 +294,7 @@ class MnmlSMTP {
                             ['From: ' . get_option('mnml_smtp_from_name') . ' <' . get_option('mnml_smtp_from_email') . '>']
                         );
                         delete_transient('mnml_smtp_failed_count');
-                        error_log('Mnml SMTP: Queue paused due to excessive failures');
+                        self::debug('Queue paused due to excessive failures');
                         break;
                     }
                 } else {
@@ -305,7 +305,7 @@ class MnmlSMTP {
                         'next_attempt' => $next_attempt,
                         'error' => $error_msg,
                     ], ['id' => $email->id]);
-                    error_log('Mnml SMTP: Email ID ' . $email->id . ' scheduled for retry at ' . date('Y-m-d H:i:s', $next_attempt));
+                    self::debug('Email ID ' . $email->id . ' scheduled for retry at ' . date('Y-m-d H:i:s', $next_attempt));
                 }
             }
         }
@@ -313,7 +313,7 @@ class MnmlSMTP {
         if (defined('DOING_MNMLSMTP') && DOING_MNMLSMTP === 'queue') {
             global $phpmailer;
             if ($phpmailer instanceof \PHPMailer\PHPMailer\PHPMailer) {
-                // error_log('Mnml SMTP: Closing SMTP connection');
+                // self::debug('Closing SMTP connection');
                 $phpmailer->smtpClose();
             }
         }
@@ -322,13 +322,13 @@ class MnmlSMTP {
             $soonest = min($next_attempts);
             wp_clear_scheduled_hook('mnml_smtp_process_queue');
             wp_schedule_single_event($soonest, 'mnml_smtp_process_queue');
-            error_log('Mnml SMTP: Scheduled retry cron for ' . date('Y-m-d H:i:s', $soonest));
+            self::debug('Scheduled retry cron for ' . date('Y-m-d H:i:s', $soonest));
         }
 
         if (!$single_email) {
             delete_transient('mnml_smtp_running');
         }
-        // error_log('Mnml SMTP: Processing completed in ' . (microtime(true) - $start_time) . ' seconds');
+        // self::debug('Processing completed in ' . (microtime(true) - $start_time) . ' seconds');
     }
 
     public static function get_failed_count() {
@@ -605,22 +605,22 @@ class MnmlSMTP {
                 $wpdb->update($table, ['status' => 'pending', 'attempts' => 0, 'next_attempt' => time(), 'error' => ''], ['id' => $id]);
                 self::send_async(['id' => $id]);
             }
-            error_log('Mnml SMTP: Resent all failed emails');
+            self::debug('Resent all failed emails');
             return 'All failed emails have been queued for resending.';
         } elseif ($action === 'resend_checked' && $email_ids) {
             foreach ($email_ids as $id) {
                 $wpdb->update($table, ['status' => 'pending', 'attempts' => 0, 'next_attempt' => time(), 'error' => ''], ['id' => $id]);
                 self::send_async(['id' => $id]);
             }
-            error_log('Mnml SMTP: Resent ' . count($email_ids) . ' selected emails');
+            self::debug('Resent ' . count($email_ids) . ' selected emails');
             return count($email_ids) . ' selected email' . (count($email_ids) > 1 ? 's' : '') . ' have been queued for resending.';
         } elseif ($action === 'clear_sent') {
             $wpdb->delete($table, ['status' => 'sent']);
-            error_log('Mnml SMTP: Cleared sent emails');
+            self::debug('Cleared sent emails');
             return 'All sent emails have been cleared.';
         } elseif ($action === 'clear_failed') {
             $wpdb->delete($table, ['status' => 'failed']);
-            error_log('Mnml SMTP: Cleared failed emails');
+            self::debug('Cleared failed emails');
             delete_transient('mnml_smtp_failed_count');
             return 'All failed emails have been cleared.';
         }
@@ -679,6 +679,18 @@ class MnmlSMTP {
         echo '<div class="notice notice-error is-dismissible">';
         echo '<p>Mnml SMTP queue is paused due to repeated failures. <a href="' . admin_url('options-general.php?page=mnml-smtp') . '">Update settings</a> or <a href="' . wp_nonce_url(admin_url('admin-post.php?action=mnml_smtp_resume'), 'mnml_smtp_resume') . '">resume queue</a>.</p>';
         echo '</div>';
+    }
+
+    public static function debug( $var, $note = '', $force = false ) {
+        // if ( ( ! defined('WP_DEBUG') || ! WP_DEBUG ) && ! $force ) {
+        //     return;
+        // }
+        $log_file = __DIR__ . "/mnml-smtp.log";
+        $timestamp = date('Y-m-d H:i:s T');
+        $note_part = $note ? "***{$note}*** " : '';
+        $value = is_string($var) ? $var : var_export($var, true);
+
+        error_log( "[{$timestamp}] {$note_part}{$value}\n", 3, $log_file );
     }
 }
 
