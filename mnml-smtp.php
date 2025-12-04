@@ -11,7 +11,7 @@ class MnmlSMTP {
     public static function init() {
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
         register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
-        add_action('mnml_smtp_cleanup', [__CLASS__, 'cleanup_queue']);
+        add_action('wp_scheduled_delete', [__CLASS__, 'cleanup_queue']);
         add_action('mnml_smtp_process_queue', [__CLASS__, 'process_queue']);
         add_filter('pre_wp_mail', [__CLASS__, 'queue_email'], 5, 2);
         add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
@@ -45,19 +45,11 @@ class MnmlSMTP {
             INDEX next_attempt (next_attempt),
             INDEX status (status)
         ) ENGINE=InnoDB {$charset_collate};");
-
-        self::schedule_cleanup();
     }
 
     public static function deactivate() {
         wp_unschedule_hook('mnml_smtp_cleanup');
         delete_option('mnml_smtp_max_attempts');
-    }
-
-    public static function schedule_cleanup() {
-        if (!wp_next_scheduled('mnml_smtp_cleanup')) {
-            wp_schedule_single_event(strtotime('tomorrow 2pm'), 'mnml_smtp_cleanup');
-        }
     }
 
     public static function set_from_email($email) {
@@ -90,12 +82,12 @@ class MnmlSMTP {
     }
 
     public static function cleanup_queue() {
-        self::schedule_cleanup();
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
         $days = get_option('mnml_smtp_queue_expiry', 7);
         if ($days > 0) {
-            $wpdb->query("DELETE FROM $table WHERE status IN ('sent', 'failed') AND created_at < DATE_SUB(NOW(), INTERVAL $days DAY)");
+            // $wpdb->query("DELETE FROM $table WHERE created_at < DATE_SUB(NOW(), INTERVAL $days DAY)");// include failed?
+            $wpdb->query("DELETE FROM $table WHERE status = 'sent' AND created_at < DATE_SUB(NOW(), INTERVAL $days DAY)");
             delete_transient('mnml_smtp_failed_count');
         }
     }
