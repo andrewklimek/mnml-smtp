@@ -49,7 +49,6 @@ class MnmlSMTP {
 
     public static function deactivate() {
         wp_unschedule_hook('mnml_smtp_cleanup');
-        delete_option('mnml_smtp_max_attempts');
     }
 
     public static function set_from_email($email) {
@@ -179,148 +178,171 @@ class MnmlSMTP {
 
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
-        $single_email = isset($atts['id']) ? intval($atts['id']) : 0;
+        $single_id = isset($atts['id']) ? intval($atts['id']) : 0;
 
-        $start_time = microtime(true);
-        if ($single_email) {
-            $emails = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND status = 'pending' AND next_attempt <= %d", $single_email, time()));
-            if (!$emails) {
-                self::debug("Mnml SMTP: Requested email $single_email was missing");
-                return;
+        if ($single_id) {
+            $email = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND status = 'pending' AND next_attempt <= %d", $single_id, time()));
+            if ($email) {
+                define('DOING_MNMLSMTP', 'single');
+                self::send_single_email($email);
+            } else {
+                self::debug("Single email $single_id not found or not pending");
             }
-            define('DOING_MNMLSMTP', 'single');
-        } else {
-            $lock = wp_generate_password(12, false);
-            if (!set_transient('mnml_smtp_running', $lock, 300)) {
-                self::debug('Queue already running');
-                return;
-            }
-            $emails = $wpdb->get_results("SELECT * FROM $table WHERE status = 'pending' AND next_attempt <= " . time() . " ORDER BY next_attempt ASC LIMIT 10");
-            if (!$emails) {
-                delete_transient('mnml_smtp_running');
-                self::debug('No pending emails to process');
-                return;
-            }
-            define('DOING_MNMLSMTP', 'queue');
+            return;
         }
 
-        // self::debug('DB query time: ' . (microtime(true) - $start_time) . ' seconds');
-        // self::debug('Processing started with ' . count($emails) . ' emails' . ($single_email ? " for ID $single_email" : ''));
+        // Batch / queue processing mode
+        $lock_acquired = $wpdb->get_var("SELECT GET_LOCK('mnml_smtp_queue', 0)");
+        if (!$lock_acquired) {
+            self::debug('Queue already running (MySQL lock held)');
+            return;
+        }
 
-        $failed_count = self::get_failed_count();
+        define('DOING_MNMLSMTP', 'queue');
+
+        $processed = 0;
         $new_failures = 0;
         $next_attempts = [];
+        $start_time = microtime(true);
 
-        foreach ($emails as $email) {
-            if (microtime(true) - $start_time > 30) {
-                self::debug('Processing timeout reached');
+        while (true) {
+            if (microtime(true) - $start_time > 30) {  // safety timeout
+                self::debug('Batch timeout reached after ' . $processed . ' emails');
                 break;
             }
-            if (!$single_email && $email->attempts == 0 && ($email->next_attempt - 30) < time()) {
-                continue;
+
+            $email = $wpdb->get_row(
+                "SELECT * FROM $table WHERE status = 'pending' AND next_attempt <= " . time()
+                 . " ORDER BY next_attempt ASC LIMIT 1"
+            );
+
+            if (!$email) {
+                self::debug('No more pending emails');
+                break;
             }
 
-            // Check if delivering locally
-            $use_local = false;
-            if ( !strpos($email->to_email, ',') ) {// only applys to single recipients
-                $local_domains = get_option('mnml_smtp_local_domains', '');
-                if ($local_domains) {
-                    $local_domains = array_map('trim', explode(',', $local_domains));
-                    $email_domain = strtolower(substr(strrchr($email->to_email, '@'), 1) ?: '');
-                    if ($email_domain && in_array($email_domain, $local_domains)) {
-                        $use_local = true;
-                        remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
-                        unset($GLOBALS['phpmailer']);
-                        // self::debug('Using local delivery for ' . $email->to_email);
-                    }
+            $success = self::send_single_email($email);
+            $processed++;
+
+            if (!$success) {
+                $new_failures++;
+
+                $current_failed = self::get_failed_count();
+
+                set_transient('mnml_smtp_failed_count', $current_failed + $new_failures, 300);
+
+                if ($current_failed + $new_failures >= 10) {
+                    set_transient('mnml_smtp_paused', true, DAY_IN_SECONDS);
+
+                    // Send admin alert with plain mail() to avoid recursion
+                    $admin_email = get_option('admin_email');
+                    $subject = 'Mnml SMTP Failure Alert';
+                    $body = "Multiple emails ($current_failed + $new_failures) failed to send. Update settings at " . admin_url('options-general.php?page=mnml-smtp') . ". View queue at " . admin_url('tools.php?page=mnml-smtp-queue');
+                    $from_name = get_option('mnml_smtp_from_name');
+                    $from_email = get_option('mnml_smtp_from_email');
+                    $headers = "From: $from_name <$from_email>\r\n";
+                    mail($admin_email, $subject, $body, $headers);
+
+                    self::debug('Queue paused due to excessive failures');
+                    break;  // stop the batch immediately
                 }
+
+                // Collect next_attempt (already updated in send_single_email)
+                $next_attempts[] = $email->next_attempt;
             }
-            // Restore SMTP hook for non-local emails
-            if (!$use_local) {
-                add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
-            }
 
-            try {
-                $send_time = microtime(true);
-                $result = wp_mail(
-                    $email->to_email,
-                    $email->subject,
-                    $email->message,
-                    unserialize($email->headers)
-                );
-                // self::debug('Send time for ID ' . $email->id . ': ' . (microtime(true) - $send_time) . ' seconds');
+            unset($email);
 
-                if ($result) {
-                    $update_time = microtime(true);
-                    $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
-                    // self::debug('DB update time for ID ' . $email->id . ': ' . (microtime(true) - $update_time) . ' seconds');
-                    // self::debug('Email ID ' . $email->id . ' sent successfully');
-                } else {
-                    throw new Exception('SMTP failure');
-                }
-            } catch (Exception $e) {
-                $attempts = $email->attempts + 1;
-                $intervals = apply_filters('mnml_smtp_retry_intervals', [300, 3600]);
-                $max_attempts = count($intervals) + 1;
-                self::debug('Email ID ' . $email->id . ' failed, attempt ' . $attempts . ' of ' . $max_attempts);
-                $error_msg = $e->getMessage();
-
-                if ($attempts >= $max_attempts) {
-                    $error_msg = "Max retries ($max_attempts) reached: $error_msg";
-                    $wpdb->update($table, [
-                        'status' => 'failed',
-                        'attempts' => $attempts,
-                        'next_attempt' => 0,
-                        'error' => $error_msg,
-                    ], ['id' => $email->id]);
-                    $new_failures++;
-                    delete_transient('mnml_smtp_failed_count');
-                    self::debug('Email ID ' . $email->id . ' marked as failed: ' . $error_msg);
-
-                    if ($failed_count + $new_failures >= 10) {
-                        set_transient('mnml_smtp_paused', true, DAY_IN_SECONDS);
-                        wp_mail(
-                            get_option('admin_email'),
-                            'Mnml SMTP Failure Alert',
-                            "Multiple emails ($failed_count + $new_failures) failed to send. Update settings at " . admin_url('options-general.php?page=mnml-smtp') . ". View queue at " . admin_url('tools.php?page=mnml-smtp-queue'),
-                            ['From: ' . get_option('mnml_smtp_from_name') . ' <' . get_option('mnml_smtp_from_email') . '>']
-                        );
-                        delete_transient('mnml_smtp_failed_count');
-                        self::debug('Queue paused due to excessive failures');
-                        break;
-                    }
-                } else {
-                    $next_attempt = time() + $intervals[$attempts - 1];
-                    $next_attempts[] = $next_attempt;
-                    $wpdb->update($table, [
-                        'attempts' => $attempts,
-                        'next_attempt' => $next_attempt,
-                        'error' => $error_msg,
-                    ], ['id' => $email->id]);
-                    self::debug('Email ID ' . $email->id . ' scheduled for retry at ' . date('Y-m-d H:i:s', $next_attempt));
-                }
-            }
+            usleep(50000); // 50 ms
         }
 
-        if (defined('DOING_MNMLSMTP') && DOING_MNMLSMTP === 'queue') {
-            global $phpmailer;
-            if ($phpmailer instanceof \PHPMailer\PHPMailer\PHPMailer) {
-                // self::debug('Closing SMTP connection');
-                $phpmailer->smtpClose();
-            }
+        global $phpmailer;
+        if ($phpmailer instanceof \PHPMailer\PHPMailer\PHPMailer) {
+            // self::debug('Closing SMTP connection');
+            $phpmailer->smtpClose();
         }
 
         if (!empty($next_attempts)) {
-            $soonest = min($next_attempts);
+            $soonest = min(array_filter($next_attempts));
             wp_clear_scheduled_hook('mnml_smtp_process_queue');
             wp_schedule_single_event($soonest, 'mnml_smtp_process_queue');
-            self::debug('Scheduled retry cron for ' . date('Y-m-d H:i:s', $soonest));
+            self::debug("Scheduled next retry at " . date('Y-m-d H:i:s', $soonest));
         }
 
-        if (!$single_email) {
-            delete_transient('mnml_smtp_running');
+        $wpdb->query("SELECT RELEASE_LOCK('mnml_smtp_queue')");
+
+        self::debug("Batch processed $processed emails in " . (microtime(true) - $start_time) . "s");
+    }
+
+    public static function send_single_email($email) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'mnml_smtp_queue';
+
+        // Check if delivering locally
+        $use_local = false;
+        if ( !strpos($email->to_email, ',') ) {// only applys to single recipients
+            $local_domains = get_option('mnml_smtp_local_domains', '');
+            if ($local_domains) {
+                $local_domains = array_map('trim', explode(',', $local_domains));
+                $email_domain = strtolower(substr(strrchr($email->to_email, '@'), 1) ?: '');
+                if ($email_domain && in_array($email_domain, $local_domains)) {
+                    $use_local = true;
+                    remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+                    unset($GLOBALS['phpmailer']);
+                    // self::debug('Using local delivery for ' . $email->to_email);
+                }
+            }
         }
-        // self::debug('Processing completed in ' . (microtime(true) - $start_time) . ' seconds');
+        // Restore SMTP hook for non-local emails
+        if (!$use_local) {
+            add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+        }
+
+        try {
+            $send_time = microtime(true);
+            $result = wp_mail(
+                $email->to_email,
+                $email->subject,
+                $email->message,
+                unserialize($email->headers)
+            );
+
+            if ($result) {
+                $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
+                self::debug("Email ID {$email->id} sent OK | Time: " . (microtime(true) - $send_time) . "s");
+                return true;
+            } else {
+                throw new Exception('wp_mail returned false');
+            }
+        } catch (Exception $e) {
+            $attempts = $email->attempts + 1;
+            $intervals = apply_filters('mnml_smtp_retry_intervals', [300, 3600]);
+            $max_attempts = count($intervals) + 1;
+            self::debug('Email ID ' . $email->id . ' failed, attempt ' . $attempts . ' of ' . $max_attempts);
+            $error_msg = $e->getMessage();
+
+            if ($attempts >= $max_attempts) {
+                $error_msg = "Max retries ($max_attempts) reached: $error_msg";
+                $wpdb->update($table, [
+                    'status' => 'failed',
+                    'attempts' => $attempts,
+                    'next_attempt' => 0,
+                    'error' => $error_msg,
+                ], ['id' => $email->id]);
+                self::debug('Email ID ' . $email->id . ' marked as failed: ' . $error_msg);
+                return false;
+            }
+
+            $next_attempt = time() + $intervals[$attempts - 1];
+            $email->next_attempt = $next_attempt;  // Update local object for caller to collect if needed
+            $wpdb->update($table, [
+                'attempts' => $attempts,
+                'next_attempt' => $next_attempt,
+                'error' => $error_msg,
+            ], ['id' => $email->id]);
+            self::debug('Email ID ' . $email->id . ' scheduled for retry at ' . date('Y-m-d H:i:s', $next_attempt));
+            return false;
+        }
     }
 
     public static function get_failed_count() {
@@ -620,7 +642,7 @@ class MnmlSMTP {
     }
 
     public static function ajax_resend() {
-        check_ajax_referer('mnml_smtp_resend', 'nonce');
+        check_ajax_referer('mnml_smtp_resend');
         if (!current_user_can('manage_options')) {
             wp_send_json_error('Unauthorized');
         }
