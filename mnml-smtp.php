@@ -309,7 +309,7 @@ class MnmlSMTP {
 
             if ($result) {
                 $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
-                self::debug("Email ID {$email->id} sent OK | Time: " . (microtime(true) - $send_time) . "s");
+                self::debug("Email ID {$email->id} sent OK | Time: " . round(microtime(true) - $send_time, 2) . "s");
                 return true;
             } else {
                 throw new Exception('wp_mail returned false');
