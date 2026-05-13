@@ -120,7 +120,7 @@ class MnmlSMTP {
     }
 
     public static function configure_smtp($phpmailer) {
-        $host = trim((string) get_option('mnml_smtp_smtp_host', ''));
+        $host = trim(get_option('mnml_smtp_smtp_host', ''));
         if ($host === '') {
             return;
         }
