@@ -124,7 +124,7 @@ class MnmlSMTP {
         $phpmailer->XMailer = 'mnml smtp';
         // $phpmailer->SMTPDebug = 3;
         // $phpmailer->Debugoutput = 'error_log';
-        $host = get_option('mnml_smtp_smtp_host', '');
+        $host = get_option('mnml_smtp_smtp_host', 'localhost');
         $phpmailer->Host = $host;
         // $phpmailer->Host = gethostbyname($host);
         // $phpmailer->SMTPOptions = ['ssl' => ['verify_peer_name' => false]];
