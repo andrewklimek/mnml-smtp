@@ -2,25 +2,32 @@
 /*
 Plugin Name: Mnml SMTP
 Description: Lightweight SMTP email sending with async queuing and retries
-Version: 1.17
+Version: 1.18
 Author: Andrew J Klimek
 Author URI: https://mnmlweb.com
 */
 
+require_once __DIR__ . '/class-mnml-smtp-delivery.php';
+
 class MnmlSMTP {
+    protected static $oauth_providers;
+
     public static function init() {
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
         register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
         add_action('wp_scheduled_delete', [__CLASS__, 'cleanup_queue']);
         add_action('mnml_smtp_process_queue', [__CLASS__, 'process_queue']);
         add_filter('pre_wp_mail', [__CLASS__, 'queue_email'], 5, 2);
-        add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
         add_action('wp_ajax_mnml_smtp_test_email', [__CLASS__, 'test_email']);
         add_action('wp_ajax_mnml_smtp_resend', [__CLASS__, 'ajax_resend']);
         add_action('wp_ajax_mnml_smtp_view_email', [__CLASS__, 'ajax_view_email']);
         add_action('admin_post_mnml_smtp_resume', [__CLASS__, 'resume_queue']);
+        add_action('admin_post_mnml_smtp_oauth_start', [__CLASS__, 'oauth_start']);
+        add_action('admin_post_mnml_smtp_oauth_callback', [__CLASS__, 'oauth_callback']);
+        add_action('admin_post_mnml_smtp_oauth_disconnect', [__CLASS__, 'oauth_disconnect']);
         add_action('admin_notices', [__CLASS__, 'paused_notice']);
+        add_action('admin_notices', [__CLASS__, 'settings_notice']);
         add_filter('wp_mail_from', [__CLASS__, 'set_from_email'], 20 );
         add_filter('wp_mail_from_name', [__CLASS__, 'set_from_name'], 20 );
     }
@@ -51,14 +58,30 @@ class MnmlSMTP {
         wp_unschedule_hook('mnml_smtp_cleanup');
     }
 
+    public static function get_delivery_method() {
+        $method = get_option('mnml_smtp_delivery_method', 'smtp');
+        return in_array($method, ['smtp', 'microsoft365', 'google'], true) ? $method : 'smtp';
+    }
+
+    public static function get_oauth_provider($slug) {
+        if (self::$oauth_providers === null) {
+            self::$oauth_providers = [
+                'microsoft365' => new MnmlSMTP_Microsoft365_OAuth(),
+                'google' => new MnmlSMTP_Google_OAuth(),
+            ];
+        }
+
+        return self::$oauth_providers[$slug] ?? null;
+    }
+
     public static function set_from_email($email) {
-        if ( substr( $email, 0, 10 ) !== 'wordpress@' ) return $email;// dont mess with it if alreay set to something other than default
+        if ( substr( $email, 0, 10 ) !== 'wordpress@' ) return $email;// dont mess with it if already set to something other than default
         $from_email = get_option('mnml_smtp_from_email', '');
         return $from_email ? $from_email : $email;
     }
 
     public static function set_from_name($name) {
-        if ( $name !== 'WordPress' ) return $name;// dont mess with it if alreay set to something other than default
+        if ( $name !== 'WordPress' ) return $name;// dont mess with it if already set to something other than default
         $from_name = get_option('mnml_smtp_from_name', '');
         return $from_name ? $from_name : $name;
     }
@@ -100,7 +123,7 @@ class MnmlSMTP {
             'to_email' => is_array($atts['to']) ? implode(',', $atts['to']) : $atts['to'],
             'subject' => $atts['subject'],
             'message' => $atts['message'],
-            'headers' => serialize($atts['headers']),
+            'headers' => maybe_serialize($atts['headers']),
             'status' => 'pending',
             'next_attempt' => time(),
             'created_at' => current_time('mysql'),
@@ -120,6 +143,10 @@ class MnmlSMTP {
     }
 
     public static function configure_smtp($phpmailer) {
+        if (self::get_delivery_method() !== 'smtp') {
+            return;
+        }
+
         $host = trim(get_option('mnml_smtp_smtp_host', ''));
         if ($host === '') {
             return;
@@ -139,6 +166,34 @@ class MnmlSMTP {
         $phpmailer->SMTPSecure = $enc === 'none' ? '' : $enc; // Map 'none' to ''
         if (defined('DOING_MNMLSMTP') && DOING_MNMLSMTP === 'queue') {
             $phpmailer->SMTPKeepAlive = true;
+        }
+    }
+
+    public static function deliver_with_wp_mail($email, $use_smtp) {
+        $headers = maybe_unserialize($email->headers);
+        if (!is_array($headers) && !is_string($headers)) {
+            $headers = [];
+        }
+
+        if ($use_smtp) {
+            add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+        } else {
+            remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+        }
+
+        unset($GLOBALS['phpmailer']);
+
+        try {
+            return wp_mail(
+                $email->to_email,
+                $email->subject,
+                $email->message,
+                $headers
+            );
+        } finally {
+            if ($use_smtp) {
+                remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
+            }
         }
     }
 
@@ -182,7 +237,9 @@ class MnmlSMTP {
         if ($single_id) {
             $email = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND status = 'pending' AND next_attempt <= %d", $single_id, time()));
             if ($email) {
-                define('DOING_MNMLSMTP', 'single');
+                if (!defined('DOING_MNMLSMTP')) {
+                    define('DOING_MNMLSMTP', 'single');
+                }
                 self::send_single_email($email);
             } else {
                 self::debug("Single email $single_id not found or not pending");
@@ -197,7 +254,9 @@ class MnmlSMTP {
             return;
         }
 
-        define('DOING_MNMLSMTP', 'queue');
+        if (!defined('DOING_MNMLSMTP')) {
+            define('DOING_MNMLSMTP', 'queue');
+        }
 
         $processed = 0;
         $new_failures = 0;
@@ -277,41 +336,17 @@ class MnmlSMTP {
         global $wpdb;
         $table = $wpdb->prefix . 'mnml_smtp_queue';
 
-        // Check if delivering locally
-        $use_local = false;
-        if ( !strpos($email->to_email, ',') ) {// only applys to single recipients
-            $local_domains = get_option('mnml_smtp_local_domains', '');
-            if ($local_domains) {
-                $local_domains = array_map('trim', explode(',', $local_domains));
-                $email_domain = strtolower(substr(strrchr($email->to_email, '@'), 1) ?: '');
-                if ($email_domain && in_array($email_domain, $local_domains)) {
-                    $use_local = true;
-                    remove_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
-                    unset($GLOBALS['phpmailer']);
-                    // self::debug('Using local delivery for ' . $email->to_email);
-                }
-            }
-        }
-        // Restore SMTP hook for non-local emails
-        if (!$use_local) {
-            add_action('phpmailer_init', [__CLASS__, 'configure_smtp']);
-        }
-
         try {
+            $transport = self::get_transport($email);
             $send_time = microtime(true);
-            $result = wp_mail(
-                $email->to_email,
-                $email->subject,
-                $email->message,
-                unserialize($email->headers)
-            );
+            $result = $transport->send($email);
 
             if ($result) {
                 $wpdb->update($table, ['status' => 'sent'], ['id' => $email->id]);
                 self::debug("Email ID {$email->id} sent OK | Time: " . round(microtime(true) - $send_time, 2) . "s");
                 return true;
             } else {
-                throw new Exception('wp_mail returned false');
+                throw new Exception('Email transport returned false');
             }
         } catch (Exception $e) {
             $attempts = $email->attempts + 1;
@@ -344,6 +379,193 @@ class MnmlSMTP {
         }
     }
 
+    public static function get_transport($email) {
+        if (self::should_use_local_delivery($email->to_email)) {
+            return new MnmlSMTP_Local_Transport();
+        }
+
+        switch (self::get_delivery_method()) {
+            case 'microsoft365':
+                return new MnmlSMTP_Microsoft365_Transport();
+            case 'google':
+                return new MnmlSMTP_Google_Transport();
+            case 'smtp':
+            default:
+                return new MnmlSMTP_SMTP_Transport();
+        }
+    }
+
+    public static function should_use_local_delivery($to_email) {
+        if (strpos($to_email, ',') !== false) {
+            return false;
+        }
+
+        $local_domains = get_option('mnml_smtp_local_domains', '');
+        if (!$local_domains) {
+            return false;
+        }
+
+        $domains = array_filter(array_map('trim', explode(',', strtolower($local_domains))));
+        $email_domain = strtolower(substr(strrchr($to_email, '@'), 1) ?: '');
+
+        return $email_domain && in_array($email_domain, $domains, true);
+    }
+
+    public static function normalize_email_payload($email) {
+        $parsed_headers = self::parse_headers(maybe_unserialize($email->headers));
+
+        return [
+            'to' => self::parse_address_list($email->to_email),
+            'subject' => (string) $email->subject,
+            'body' => (string) $email->message,
+            'content_type' => $parsed_headers['content_type'],
+            'charset' => $parsed_headers['charset'],
+            'cc' => $parsed_headers['cc'],
+            'bcc' => $parsed_headers['bcc'],
+            'reply_to' => $parsed_headers['reply_to'],
+            'custom_headers' => $parsed_headers['custom_headers'],
+            'attachments' => [],
+        ];
+    }
+
+    public static function parse_headers($headers) {
+        $normalized = [
+            'content_type' => 'text/plain',
+            'charset' => 'UTF-8',
+            'cc' => [],
+            'bcc' => [],
+            'reply_to' => [],
+            'custom_headers' => [],
+        ];
+
+        if (empty($headers)) {
+            return $normalized;
+        }
+
+        if (is_string($headers)) {
+            $headers = preg_split('/\r\n|\r|\n/', $headers);
+        }
+
+        if (!is_array($headers)) {
+            return $normalized;
+        }
+
+        foreach ($headers as $key => $value) {
+            $header_name = '';
+            $header_value = $value;
+
+            if (is_int($key)) {
+                if (!is_string($value) || strpos($value, ':') === false) {
+                    continue;
+                }
+                list($header_name, $header_value) = array_map('trim', explode(':', $value, 2));
+            } else {
+                $header_name = trim((string) $key);
+                if (is_array($value)) {
+                    $header_value = implode(', ', $value);
+                }
+            }
+
+            switch (strtolower($header_name)) {
+                case 'cc':
+                    $normalized['cc'] = array_merge($normalized['cc'], self::parse_address_list($header_value));
+                    break;
+                case 'bcc':
+                    $normalized['bcc'] = array_merge($normalized['bcc'], self::parse_address_list($header_value));
+                    break;
+                case 'reply-to':
+                    $normalized['reply_to'] = array_merge($normalized['reply_to'], self::parse_address_list($header_value));
+                    break;
+                case 'content-type':
+                    $parts = array_map('trim', explode(';', (string) $header_value));
+                    if (!empty($parts[0])) {
+                        $normalized['content_type'] = strtolower($parts[0]);
+                    }
+                    foreach (array_slice($parts, 1) as $part) {
+                        if (stripos($part, 'charset=') === 0) {
+                            $normalized['charset'] = trim(substr($part, 8), " \t\n\r\0\x0B\"");
+                        }
+                    }
+                    break;
+                default:
+                    $normalized['custom_headers'][] = [
+                        'name' => $header_name,
+                        'value' => trim((string) $header_value),
+                    ];
+                    break;
+            }
+        }
+
+        return $normalized;
+    }
+
+    public static function parse_address_list($value) {
+        if (is_array($value)) {
+            $value = implode(',', $value);
+        }
+
+        $addresses = [];
+        foreach (str_getcsv((string) $value) as $item) {
+            $item = trim($item);
+            if ($item === '') {
+                continue;
+            }
+
+            $name = '';
+            $email = $item;
+            if (preg_match('/^(.*)<([^>]+)>$/', $item, $matches)) {
+                $name = trim(trim($matches[1]), "\"' ");
+                $email = trim($matches[2]);
+            }
+
+            $email = sanitize_email($email);
+            if (!$email || !is_email($email)) {
+                continue;
+            }
+
+            $addresses[] = [
+                'email' => $email,
+                'name' => $name,
+            ];
+        }
+
+        return $addresses;
+    }
+
+    public static function format_graph_recipients($addresses) {
+        return array_values(array_filter(array_map(function ($address) {
+            if (empty($address['email'])) {
+                return null;
+            }
+
+            return [
+                'emailAddress' => [
+                    'address' => $address['email'],
+                    'name' => $address['name'] ?? '',
+                ],
+            ];
+        }, $addresses)));
+    }
+
+    public static function extract_remote_error($response) {
+        $body = wp_remote_retrieve_body($response);
+        $payload = json_decode($body, true);
+
+        if (is_array($payload)) {
+            if (!empty($payload['error']['message'])) {
+                return $payload['error']['message'];
+            }
+            if (!empty($payload['error_description'])) {
+                return $payload['error_description'];
+            }
+            if (!empty($payload['message'])) {
+                return $payload['message'];
+            }
+        }
+
+        return $body ?: 'Unknown remote error.';
+    }
+
     public static function get_failed_count() {
         $count = get_transient('mnml_smtp_failed_count');
         if ($count === false) {
@@ -374,10 +596,24 @@ class MnmlSMTP {
                     'desc' => 'Name for outgoing emails.',
                     'sanitize' => 'sanitize_text_field',
                 ],
+                'delivery_method' => [
+                    'type' => 'select',
+                    'label' => 'Delivery Method',
+                    'default' => 'smtp',
+                    'options' => [
+                        'smtp' => 'SMTP',
+                        'microsoft365' => 'Microsoft 365',
+                        'google' => 'Google (OAuth foundation)',
+                    ],
+                    'desc' => 'Choose how queued email is delivered.',
+                    'sanitize' => function ($value) {
+                        return in_array($value, ['smtp', 'microsoft365', 'google'], true) ? $value : 'smtp';
+                    },
+                ],
                 'local_domains' => [
                     'type' => 'text',
                     'label' => 'Local Domains',
-                    'desc' => 'Domains to deliver locally, bypassing SMTP.',
+                    'desc' => 'Domains to deliver locally, bypassing the selected transport.',
                     'sanitize' => 'sanitize_text_field',
                 ],
                 'queue_expiry' => [
@@ -399,6 +635,7 @@ class MnmlSMTP {
                     'label' => 'SMTP Host',
                     'desc' => 'SMTP server host (e.g., smtp.example.com, mail.example.net).',
                     'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'smtp'],
                 ],
                 'smtp_port' => [
                     'type' => 'number',
@@ -407,6 +644,7 @@ class MnmlSMTP {
                     'size' => 'small',
                     'default' => '587',
                     'sanitize' => function ($value) { return max(1, (int)$value); },
+                    'show' => ['delivery_method' => 'smtp'],
                 ],
                 'smtp_encryption' => [
                     'type' => 'select',
@@ -419,24 +657,121 @@ class MnmlSMTP {
                     'default' => 'tls',
                     'desc' => 'Encryption type for SMTP.',
                     'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'smtp'],
                 ],
                 'smtp_username' => [
                     'type' => 'text',
                     'label' => 'SMTP Username',
                     'desc' => 'SMTP account username.',
                     'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'smtp'],
                 ],
                 'smtp_password' => [
                     'type' => 'password',
                     'label' => 'SMTP Password',
-                    'desc' => 'SMTP password (store in wp-config.php for security).',
+                    'desc' => 'SMTP password (or define MNML_SMTP_PASSWORD in wp-config.php).',
                     'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'smtp'],
+                ],
+                'microsoft365_status' => [
+                    'type' => 'callback',
+                    'label' => 'Microsoft 365 OAuth',
+                    'callback' => 'MnmlSMTP::render_oauth_status',
+                    'provider' => 'microsoft365',
+                    'show' => ['delivery_method' => 'microsoft365'],
+                ],
+                'microsoft365_tenant_id' => [
+                    'type' => 'text',
+                    'label' => 'Microsoft 365 Tenant ID',
+                    'desc' => 'Tenant ID (or define MNML_SMTP_MICROSOFT365_TENANT_ID).',
+                    'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'microsoft365'],
+                ],
+                'microsoft365_client_id' => [
+                    'type' => 'text',
+                    'label' => 'Microsoft 365 Client ID',
+                    'desc' => 'App registration client ID (or define MNML_SMTP_MICROSOFT365_CLIENT_ID).',
+                    'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'microsoft365'],
+                ],
+                'microsoft365_client_secret' => [
+                    'type' => 'password',
+                    'label' => 'Microsoft 365 Client Secret',
+                    'desc' => 'Client secret (or define MNML_SMTP_MICROSOFT365_CLIENT_SECRET).',
+                    'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'microsoft365'],
+                ],
+                'microsoft365_sender' => [
+                    'type' => 'email',
+                    'label' => 'Microsoft 365 Sender',
+                    'desc' => 'Mailbox used for Graph sendMail (or define MNML_SMTP_MICROSOFT365_SENDER).',
+                    'sanitize' => 'sanitize_email',
+                    'show' => ['delivery_method' => 'microsoft365'],
+                ],
+                'google_status' => [
+                    'type' => 'callback',
+                    'label' => 'Google OAuth',
+                    'callback' => 'MnmlSMTP::render_oauth_status',
+                    'provider' => 'google',
+                    'show' => ['delivery_method' => 'google'],
+                ],
+                'google_client_id' => [
+                    'type' => 'text',
+                    'label' => 'Google Client ID',
+                    'desc' => 'OAuth client ID (or define MNML_SMTP_GOOGLE_CLIENT_ID).',
+                    'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'google'],
+                ],
+                'google_client_secret' => [
+                    'type' => 'password',
+                    'label' => 'Google Client Secret',
+                    'desc' => 'OAuth client secret (or define MNML_SMTP_GOOGLE_CLIENT_SECRET).',
+                    'sanitize' => 'sanitize_text_field',
+                    'show' => ['delivery_method' => 'google'],
+                ],
+                'google_sender' => [
+                    'type' => 'email',
+                    'label' => 'Google Sender',
+                    'desc' => 'Sender address for future Gmail API delivery (or define MNML_SMTP_GOOGLE_SENDER).',
+                    'sanitize' => 'sanitize_email',
+                    'show' => ['delivery_method' => 'google'],
                 ],
             ],
         ];
         $title = 'Mnml SMTP Settings';
         require __DIR__ . '/settings-framework.php';
         echo "<p><a href='" . admin_url('tools.php?page=mnml-smtp-queue') . "'>View Email Log</a></p>";
+    }
+
+    public static function render_oauth_status($key, $value, $field) {
+        $provider = !empty($field['provider']) ? self::get_oauth_provider($field['provider']) : null;
+        if (!($provider instanceof MnmlSMTP_OAuth_Provider)) {
+            echo 'Provider unavailable.';
+            return;
+        }
+
+        echo '<p>' . esc_html($provider->get_status_description()) . '</p>';
+        echo '<p><strong>Callback URL:</strong> <code>' . esc_html($provider->get_redirect_uri()) . '</code></p>';
+
+        if ($provider->get_slug() === 'google') {
+            echo '<p>Google OAuth is wired up for future reuse, but Gmail delivery is not implemented yet.</p>';
+        }
+
+        if ($provider->is_configured()) {
+            $connect_url = wp_nonce_url(
+                admin_url('admin-post.php?action=mnml_smtp_oauth_start&provider=' . $provider->get_slug()),
+                'mnml_smtp_oauth_start_' . $provider->get_slug()
+            );
+            echo '<a class="button" href="' . esc_url($connect_url) . '">' . ($provider->is_connected() ? 'Reconnect' : 'Connect') . '</a>';
+
+            if ($provider->is_connected()) {
+                $disconnect_url = wp_nonce_url(
+                    admin_url('admin-post.php?action=mnml_smtp_oauth_disconnect&provider=' . $provider->get_slug()),
+                    'mnml_smtp_oauth_disconnect_' . $provider->get_slug()
+                );
+                echo ' <a class="button button-secondary" href="' . esc_url($disconnect_url) . '">Disconnect</a>';
+            }
+        }
     }
 
     public static function render_test_email($key, $value, $field) {
@@ -477,6 +812,85 @@ class MnmlSMTP {
         } catch (Exception $e) {
             wp_send_json(['message' => 'Test email failed: ' . $e->getMessage()]);
         }
+    }
+
+    public static function oauth_start() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+
+        $provider_slug = isset($_GET['provider']) ? sanitize_key(wp_unslash($_GET['provider'])) : '';
+        $provider = self::get_oauth_provider($provider_slug);
+        if (!($provider instanceof MnmlSMTP_OAuth_Provider)) {
+            self::redirect_to_settings(['mnml_smtp_notice' => 'Unknown OAuth provider.', 'mnml_smtp_notice_type' => 'error']);
+        }
+
+        check_admin_referer('mnml_smtp_oauth_start_' . $provider->get_slug());
+
+        try {
+            wp_safe_redirect($provider->get_authorization_url(get_current_user_id()));
+            exit;
+        } catch (Exception $e) {
+            self::redirect_to_settings(['mnml_smtp_notice' => $e->getMessage(), 'mnml_smtp_notice_type' => 'error']);
+        }
+    }
+
+    public static function oauth_callback() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+
+        $provider_slug = isset($_GET['provider']) ? sanitize_key(wp_unslash($_GET['provider'])) : '';
+        $provider = self::get_oauth_provider($provider_slug);
+        if (!($provider instanceof MnmlSMTP_OAuth_Provider)) {
+            self::redirect_to_settings(['mnml_smtp_notice' => 'Unknown OAuth provider.', 'mnml_smtp_notice_type' => 'error']);
+        }
+
+        try {
+            $provider->handle_callback($_GET, get_current_user_id());
+            self::redirect_to_settings(['mnml_smtp_notice' => $provider->get_label() . ' connected successfully.', 'mnml_smtp_notice_type' => 'success']);
+        } catch (Exception $e) {
+            self::redirect_to_settings(['mnml_smtp_notice' => $e->getMessage(), 'mnml_smtp_notice_type' => 'error']);
+        }
+    }
+
+    public static function oauth_disconnect() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized');
+        }
+
+        $provider_slug = isset($_GET['provider']) ? sanitize_key(wp_unslash($_GET['provider'])) : '';
+        $provider = self::get_oauth_provider($provider_slug);
+        if (!($provider instanceof MnmlSMTP_OAuth_Provider)) {
+            self::redirect_to_settings(['mnml_smtp_notice' => 'Unknown OAuth provider.', 'mnml_smtp_notice_type' => 'error']);
+        }
+
+        check_admin_referer('mnml_smtp_oauth_disconnect_' . $provider->get_slug());
+        $provider->disconnect();
+        self::redirect_to_settings(['mnml_smtp_notice' => $provider->get_label() . ' disconnected.', 'mnml_smtp_notice_type' => 'success']);
+    }
+
+    public static function settings_notice() {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+        $page = !empty($_GET['page']) ? sanitize_key(wp_unslash($_GET['page'])) : '';
+        $notice = !empty($_GET['mnml_smtp_notice']) ? sanitize_text_field(wp_unslash($_GET['mnml_smtp_notice'])) : '';
+        if ($page !== 'mnml-smtp' || $notice === '') {
+            return;
+        }
+
+        $type = !empty($_GET['mnml_smtp_notice_type']) ? sanitize_key(wp_unslash($_GET['mnml_smtp_notice_type'])) : 'success';
+        if (!in_array($type, ['success', 'error', 'warning'], true)) {
+            $type = 'success';
+        }
+
+        echo '<div class="notice notice-' . esc_attr($type) . '"><p>' . esc_html($notice) . '</p></div>';
+    }
+
+    protected static function redirect_to_settings($args) {
+        wp_safe_redirect(add_query_arg($args, admin_url('options-general.php?page=mnml-smtp')));
+        exit;
     }
 
     public static function queue_page() {
@@ -664,12 +1078,13 @@ class MnmlSMTP {
         check_admin_referer('mnml_smtp_resume');
         delete_transient('mnml_smtp_paused');
         self::send_async(['queue' => true]);
-        wp_redirect(admin_url('tools.php?page=mnml-smtp-queue'));
+        wp_safe_redirect(admin_url('tools.php?page=mnml-smtp-queue'));
         exit;
     }
 
     public static function paused_notice() {
-        if (!get_transient('mnml_smtp_paused') || !current_user_can('manage_options') || !in_array(get_current_screen()->id, ['settings_page_mnml-smtp', 'tools_page_mnml-smtp-queue'])) {
+        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+        if (!get_transient('mnml_smtp_paused') || !current_user_can('manage_options') || !$screen || !in_array($screen->id, ['settings_page_mnml-smtp', 'tools_page_mnml-smtp-queue'], true)) {
             return;
         }
         echo '<div class="notice notice-error is-dismissible">';
