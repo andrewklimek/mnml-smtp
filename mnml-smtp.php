@@ -120,15 +120,14 @@ class MnmlSMTP {
     }
 
     public static function configure_smtp($phpmailer) {
-        $mailer_type = get_option('mnml_smtp_mailer_type', 'smtp');
-        if (!in_array($mailer_type, ['smtp', 'ses', 'google', 'brevo'])) {
+        $host = trim(get_option('mnml_smtp_smtp_host', ''));
+        if ($host === '') {
             return;
         }
         $phpmailer->isSMTP();
         $phpmailer->XMailer = 'mnml smtp';
         // $phpmailer->SMTPDebug = 3;
         // $phpmailer->Debugoutput = 'error_log';
-        $host = get_option('mnml_smtp_smtp_host', $mailer_type === 'google' ? 'smtp.gmail.com' : ($mailer_type === 'ses' ? 'email-smtp.us-east-1.amazonaws.com' : ($mailer_type === 'brevo' ? 'smtp-relay.brevo.com' : 'smtp.gmail.com')));
         $phpmailer->Host = $host;
         // $phpmailer->Host = gethostbyname($host);
         // $phpmailer->SMTPOptions = ['ssl' => ['verify_peer_name' => false]];
@@ -363,18 +362,6 @@ class MnmlSMTP {
     public static function settings_page() {
         $options = [
             'mnml_smtp_' => [
-                'mailer_type' => [
-                    'type' => 'select',
-                    'label' => 'Mailer Type',
-                    'options' => [
-                        'smtp' => 'Generic SMTP',
-                        'ses' => 'Amazon SES SMTP',
-                        'google' => 'Google Workspace SMTP',
-                        'brevo' => 'Brevo SMTP',
-                    ],
-                    'desc' => 'Choose the mailer for sending emails.',
-                    'sanitize' => 'sanitize_text_field',
-                ],
                 'from_email' => [
                     'type' => 'email',
                     'label' => 'From Email',
@@ -410,15 +397,13 @@ class MnmlSMTP {
                 'smtp_host' => [
                     'type' => 'text',
                     'label' => 'SMTP Host',
-                    'desc' => 'SMTP server host (e.g., smtp.gmail.com, email-smtp.us-east-1.amazonaws.com).',
-                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'desc' => 'SMTP server host (e.g., smtp.example.com, mail.example.net).',
                     'sanitize' => 'sanitize_text_field',
                 ],
                 'smtp_port' => [
                     'type' => 'number',
                     'label' => 'SMTP Port',
                     'desc' => 'SMTP port (e.g., 587 for TLS).',
-                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
                     'size' => 'small',
                     'default' => '587',
                     'sanitize' => function ($value) { return max(1, (int)$value); },
@@ -433,21 +418,18 @@ class MnmlSMTP {
                     ],
                     'default' => 'tls',
                     'desc' => 'Encryption type for SMTP.',
-                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
                     'sanitize' => 'sanitize_text_field',
                 ],
                 'smtp_username' => [
                     'type' => 'text',
                     'label' => 'SMTP Username',
-                    'desc' => 'SMTP username or Google app password.',
-                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
+                    'desc' => 'SMTP account username.',
                     'sanitize' => 'sanitize_text_field',
                 ],
                 'smtp_password' => [
                     'type' => 'password',
                     'label' => 'SMTP Password',
                     'desc' => 'SMTP password (store in wp-config.php for security).',
-                    'show' => ['mailer_type' => ['smtp', 'ses', 'google', 'brevo']],
                     'sanitize' => 'sanitize_text_field',
                 ],
             ],
