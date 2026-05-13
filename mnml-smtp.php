@@ -75,13 +75,13 @@ class MnmlSMTP {
     }
 
     public static function set_from_email($email) {
-        if ( substr( $email, 0, 10 ) !== 'wordpress@' ) return $email;// dont mess with it if alreay set to something other than default
+        if ( substr( $email, 0, 10 ) !== 'wordpress@' ) return $email;// dont mess with it if already set to something other than default
         $from_email = get_option('mnml_smtp_from_email', '');
         return $from_email ? $from_email : $email;
     }
 
     public static function set_from_name($name) {
-        if ( $name !== 'WordPress' ) return $name;// dont mess with it if alreay set to something other than default
+        if ( $name !== 'WordPress' ) return $name;// dont mess with it if already set to something other than default
         $from_name = get_option('mnml_smtp_from_name', '');
         return $from_name ? $from_name : $name;
     }
@@ -874,7 +874,9 @@ class MnmlSMTP {
         if (!current_user_can('manage_options')) {
             return;
         }
-        if (empty($_GET['page']) || $_GET['page'] !== 'mnml-smtp' || empty($_GET['mnml_smtp_notice'])) {
+        $page = !empty($_GET['page']) ? sanitize_key(wp_unslash($_GET['page'])) : '';
+        $notice = !empty($_GET['mnml_smtp_notice']) ? sanitize_text_field(wp_unslash($_GET['mnml_smtp_notice'])) : '';
+        if ($page !== 'mnml-smtp' || $notice === '') {
             return;
         }
 
@@ -883,7 +885,7 @@ class MnmlSMTP {
             $type = 'success';
         }
 
-        echo '<div class="notice notice-' . esc_attr($type) . '"><p>' . esc_html(wp_unslash($_GET['mnml_smtp_notice'])) . '</p></div>';
+        echo '<div class="notice notice-' . esc_attr($type) . '"><p>' . esc_html($notice) . '</p></div>';
     }
 
     protected static function redirect_to_settings($args) {
