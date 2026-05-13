@@ -120,11 +120,14 @@ class MnmlSMTP {
     }
 
     public static function configure_smtp($phpmailer) {
+        $host = trim((string) get_option('mnml_smtp_smtp_host', ''));
+        if ($host === '') {
+            return;
+        }
         $phpmailer->isSMTP();
         $phpmailer->XMailer = 'mnml smtp';
         // $phpmailer->SMTPDebug = 3;
         // $phpmailer->Debugoutput = 'error_log';
-        $host = get_option('mnml_smtp_smtp_host', 'localhost');
         $phpmailer->Host = $host;
         // $phpmailer->Host = gethostbyname($host);
         // $phpmailer->SMTPOptions = ['ssl' => ['verify_peer_name' => false]];
@@ -394,7 +397,7 @@ class MnmlSMTP {
                 'smtp_host' => [
                     'type' => 'text',
                     'label' => 'SMTP Host',
-                    'desc' => 'SMTP server host (e.g., smtp.gmail.com, smtp.office365.com).',
+                    'desc' => 'SMTP server host (e.g., smtp.example.com, mail.example.net).',
                     'sanitize' => 'sanitize_text_field',
                 ],
                 'smtp_port' => [
